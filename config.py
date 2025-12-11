@@ -27,19 +27,20 @@ class Config:
 
     # Projector
     proj_hidden_dim: int = 2048
-    proj_dim: int = 2048
+    proj_dim: int = 128  # Reference uses 128
 
     # Training
     batch_size: int = 256
-    epochs: int = 200
+    epochs: int = 800  # Reference uses 800
     lr_encoder: float = 2e-3
     lr_probe: float = 1e-3
-    weight_decay: float = 1e-4
-    warmup_epochs: int = 10
+    weight_decay_encoder: float = 5e-2  # Reference uses 5e-2
+    weight_decay_probe: float = 1e-7  # Reference uses 1e-7
+    warmup_epochs: int = 1  # 1 epoch warmup
 
     # Loss
-    lambda_sigreg: float = 0.5  # Balance between SIGReg and invariance loss
-    num_views: int = 2  # Number of augmented views per sample
+    lambda_sigreg: float = 0.02  # Reference uses 0.02
+    num_views: int = 4  # Reference uses 4 views
 
     # SIGReg parameters
     sigreg_num_knots: int = 17

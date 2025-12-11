@@ -208,3 +208,9 @@ __marimo__/
 
 # Claude instructions (local only)
 Claude.md
+
+# Reference repos (local only)
+ref/
+
+# Downloaded datasets
+data/imagenette*/

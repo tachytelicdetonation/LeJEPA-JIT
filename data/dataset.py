@@ -5,106 +5,80 @@ ImageNette is a subset of ImageNet with 10 easy-to-classify classes:
 - tench, English springer, cassette player, chain saw, church,
 - French horn, garbage truck, gas pump, golf ball, parachute
 
-Uses HuggingFace datasets for easy downloading and caching.
+Downloads from fastai's S3 bucket and uses torchvision ImageFolder.
 """
 
-from typing import Callable, Optional
+import tarfile
+import urllib.request
+from pathlib import Path
 
 import torch
 from torch.utils.data import Dataset, DataLoader
-from torchvision import transforms
-from PIL import Image
-
-try:
-    from datasets import load_dataset
-
-    HF_AVAILABLE = True
-except ImportError:
-    HF_AVAILABLE = False
+from torchvision.datasets import ImageFolder
+from torchvision.transforms import v2
 
 
-class MultiViewTransform:
+# Dataset URL and paths
+DATA_URL = "https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-160.tgz"
+DATA_DIR = Path("./data/imagenette2-160")
+
+
+def download_imagenette(data_dir: Path = DATA_DIR) -> Path:
+    """Download and extract ImageNette dataset if not present."""
+    if data_dir.exists():
+        return data_dir
+
+    data_dir.parent.mkdir(parents=True, exist_ok=True)
+    tgz_path = data_dir.parent / "imagenette2-160.tgz"
+
+    print(f"Downloading ImageNette from {DATA_URL}...")
+    urllib.request.urlretrieve(DATA_URL, tgz_path)
+    print("Download complete. Extracting...")
+
+    with tarfile.open(tgz_path, "r:gz") as tar:
+        tar.extractall(data_dir.parent, filter="data")
+
+    tgz_path.unlink()  # Remove archive
+    print(f"Extracted to {data_dir}")
+    return data_dir
+
+
+def get_train_transform(img_size: int = 128) -> v2.Compose:
     """
-    Generates multiple augmented views of the same image.
-
-    Used for self-supervised learning where we want different
-    augmentations of the same image to have similar embeddings.
-    """
-
-    def __init__(self, base_transform: Callable, num_views: int = 2):
-        self.base_transform = base_transform
-        self.num_views = num_views
-
-    def __call__(self, img: Image.Image) -> torch.Tensor:
-        """
-        Apply transform multiple times to generate views.
-
-        Returns:
-            (num_views, C, H, W) tensor of augmented views
-        """
-        views = [self.base_transform(img) for _ in range(self.num_views)]
-        return torch.stack(views)
-
-
-def get_train_transform(img_size: int = 128) -> transforms.Compose:
-    """
-    Strong augmentations for training (from LeJEPA).
+    Strong augmentations for training (matching LeJEPA MINIMAL.md).
 
     Includes:
-    - Random resized crop
+    - Random resized crop (scale 0.08-1.0)
     - Color jitter
     - Grayscale conversion
     - Gaussian blur
     - Solarization
     - Horizontal flip
     """
-    return transforms.Compose(
+    return v2.Compose(
         [
-            transforms.RandomResizedCrop(
-                img_size,
-                scale=(0.2, 1.0),
-                interpolation=transforms.InterpolationMode.BICUBIC,
-            ),
-            transforms.RandomHorizontalFlip(p=0.5),
-            transforms.RandomApply(
-                [
-                    transforms.ColorJitter(
-                        brightness=0.4,
-                        contrast=0.4,
-                        saturation=0.2,
-                        hue=0.1,
-                    )
-                ],
-                p=0.8,
-            ),
-            transforms.RandomGrayscale(p=0.2),
-            transforms.RandomApply(
-                [transforms.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))], p=0.5
-            ),
-            transforms.RandomSolarize(threshold=128, p=0.2),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
+            v2.RandomResizedCrop(img_size, scale=(0.08, 1.0)),
+            v2.RandomApply([v2.ColorJitter(0.8, 0.8, 0.8, 0.2)], p=0.8),
+            v2.RandomGrayscale(p=0.2),
+            v2.RandomApply([v2.GaussianBlur(kernel_size=7, sigma=(0.1, 2.0))]),
+            v2.RandomApply([v2.RandomSolarize(threshold=128)], p=0.2),
+            v2.RandomHorizontalFlip(),
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
 
 
-def get_val_transform(img_size: int = 128) -> transforms.Compose:
+def get_val_transform(img_size: int = 128) -> v2.Compose:
     """Standard validation transform (resize + center crop)."""
-    return transforms.Compose(
+    return v2.Compose(
         [
-            transforms.Resize(
-                int(img_size * 1.14),  # Resize to slightly larger
-                interpolation=transforms.InterpolationMode.BICUBIC,
-            ),
-            transforms.CenterCrop(img_size),
-            transforms.ToTensor(),
-            transforms.Normalize(
-                mean=[0.485, 0.456, 0.406],
-                std=[0.229, 0.224, 0.225],
-            ),
+            v2.Resize(img_size),
+            v2.CenterCrop(img_size),
+            v2.ToImage(),
+            v2.ToDtype(torch.float32, scale=True),
+            v2.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
         ]
     )
 
@@ -113,8 +87,7 @@ class ImageNetteDataset(Dataset):
     """
     ImageNette dataset wrapper for LeJEPA training.
 
-    Supports both single-view (for validation) and multi-view (for training)
-    transforms.
+    Supports multi-view transforms for self-supervised learning.
     """
 
     def __init__(
@@ -122,76 +95,65 @@ class ImageNetteDataset(Dataset):
         split: str = "train",
         img_size: int = 128,
         num_views: int = 2,
-        transform: Optional[Callable] = None,
+        data_dir: Path = DATA_DIR,
     ):
         """
         Args:
-            split: "train" or "validation"
+            split: "train" or "val"
             img_size: Target image size
-            num_views: Number of augmented views (only for training)
-            transform: Custom transform (overrides default)
+            num_views: Number of augmented views per sample
+            data_dir: Path to imagenette2-160 directory
         """
-        if not HF_AVAILABLE:
-            raise ImportError(
-                "HuggingFace datasets required. Install with: pip install datasets"
-            )
+        # Ensure dataset is downloaded
+        download_imagenette(data_dir)
 
         self.split = split
         self.img_size = img_size
         self.num_views = num_views
 
-        # Load dataset from HuggingFace (use "160px" config like LeJEPA)
-        self.dataset = load_dataset(
-            "frgfm/imagenette", "160px", split=split, trust_remote_code=True
-        )
+        # Map split names
+        folder_split = "val" if split == "validation" else split
+        split_dir = data_dir / folder_split
+
+        # Load with ImageFolder (no transform - we apply our own)
+        self.dataset = ImageFolder(split_dir)
+        self.num_classes = 10
 
         # Set up transforms
-        if transform is not None:
-            self.transform = transform
-        elif split == "train":
-            base_transform = get_train_transform(img_size)
-            self.transform = MultiViewTransform(base_transform, num_views)
+        if split == "train":
+            self.transform = get_train_transform(img_size)
         else:
             self.transform = get_val_transform(img_size)
-
-        # Get number of classes
-        self.num_classes = 10  # ImageNette has 10 classes
 
     def __len__(self) -> int:
         return len(self.dataset)
 
-    def __getitem__(self, idx: int) -> dict:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, int]:
         """
         Get item from dataset.
 
         Returns:
-            Dictionary with:
-                - image: (V, C, H, W) for training or (C, H, W) for validation
-                - label: Integer class label
+            (images, label) where images is (V, C, H, W) tensor
         """
-        item = self.dataset[idx]
-        image = item["image"]
-        label = item["label"]
+        img, label = self.dataset[idx]
 
         # Convert to RGB if needed
-        if image.mode != "RGB":
-            image = image.convert("RGB")
+        if img.mode != "RGB":
+            img = img.convert("RGB")
 
-        # Apply transform
-        image = self.transform(image)
+        # Generate multiple views
+        views = torch.stack([self.transform(img) for _ in range(self.num_views)])
 
-        return {
-            "image": image,
-            "label": label,
-        }
+        return views, label
 
 
 def get_dataloaders(
     batch_size: int = 256,
     img_size: int = 128,
-    num_views: int = 2,
+    num_views: int = 4,
     num_workers: int = 8,
     pin_memory: bool = True,
+    data_dir: Path = DATA_DIR,
 ) -> tuple[DataLoader, DataLoader]:
     """
     Create training and validation dataloaders.
@@ -202,6 +164,7 @@ def get_dataloaders(
         num_views: Number of augmented views for training
         num_workers: Number of data loading workers
         pin_memory: Pin memory for faster GPU transfer
+        data_dir: Path to dataset
 
     Returns:
         (train_loader, val_loader)
@@ -210,12 +173,14 @@ def get_dataloaders(
         split="train",
         img_size=img_size,
         num_views=num_views,
+        data_dir=data_dir,
     )
 
     val_dataset = ImageNetteDataset(
-        split="validation",
+        split="val",
         img_size=img_size,
         num_views=1,  # Single view for validation
+        data_dir=data_dir,
     )
 
     train_loader = DataLoader(
@@ -238,17 +203,21 @@ def get_dataloaders(
     return train_loader, val_loader
 
 
+# ImageNet class ID to name mapping for ImageNette
+CLASS_ID_TO_NAME = {
+    "n01440764": "tench",
+    "n02102040": "English springer",
+    "n02979186": "cassette player",
+    "n03000684": "chain saw",
+    "n03028079": "church",
+    "n03394916": "French horn",
+    "n03417042": "garbage truck",
+    "n03425413": "gas pump",
+    "n03445777": "golf ball",
+    "n03888257": "parachute",
+}
+
+
 def get_class_names() -> list[str]:
-    """Return ImageNette class names."""
-    return [
-        "tench",
-        "English springer",
-        "cassette player",
-        "chain saw",
-        "church",
-        "French horn",
-        "garbage truck",
-        "gas pump",
-        "golf ball",
-        "parachute",
-    ]
+    """Return ImageNette class names in folder order."""
+    return list(CLASS_ID_TO_NAME.values())

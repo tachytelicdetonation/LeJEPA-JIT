@@ -19,61 +19,43 @@ Usage:
 """
 
 import argparse
-import random
 import time
 from pathlib import Path
 
-import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
+from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from tqdm import tqdm
 
 from config import Config, get_config
-from models import LeJEPA
-from models.lejepa import LinearProbe, create_lejepa
-from losses import LeJEPALoss
 from data import get_dataloaders
+from losses import LeJEPALoss
+from models.lejepa import LinearProbe, create_lejepa
 
 
-def set_seed(seed: int):
-    """Set random seed for reproducibility."""
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-
-
-def get_lr_scheduler(
+def get_schedulers(
     optimizer: torch.optim.Optimizer,
-    warmup_epochs: int,
-    total_epochs: int,
-    steps_per_epoch: int,
-) -> torch.optim.lr_scheduler.LambdaLR:
+    warmup_steps: int,
+    total_steps: int,
+) -> SequentialLR:
     """Create learning rate scheduler with warmup and cosine decay."""
-    warmup_steps = warmup_epochs * steps_per_epoch
-    total_steps = total_epochs * steps_per_epoch
-
-    def lr_lambda(step):
-        if step < warmup_steps:
-            # Linear warmup
-            return step / warmup_steps
-        else:
-            # Cosine decay
-            progress = (step - warmup_steps) / (total_steps - warmup_steps)
-            return 0.5 * (1 + np.cos(np.pi * progress))
-
-    return torch.optim.lr_scheduler.LambdaLR(optimizer, lr_lambda)
+    warmup = LinearLR(optimizer, start_factor=0.01, total_iters=warmup_steps)
+    cosine = CosineAnnealingLR(
+        optimizer, T_max=total_steps - warmup_steps, eta_min=1e-5
+    )
+    return SequentialLR(
+        optimizer, schedulers=[warmup, cosine], milestones=[warmup_steps]
+    )
 
 
 def train_one_epoch(
-    model: LeJEPA,
+    model: nn.Module,
     probe: LinearProbe,
     loss_fn: LeJEPALoss,
     optimizer: torch.optim.Optimizer,
-    probe_optimizer: torch.optim.Optimizer,
-    scheduler: torch.optim.lr_scheduler.LambdaLR,
+    scheduler: SequentialLR,
     train_loader,
     device: torch.device,
     epoch: int,
@@ -93,49 +75,48 @@ def train_one_epoch(
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
 
-    for batch_idx, batch in enumerate(pbar):
-        images = batch["image"].to(device)  # (B, V, C, H, W)
-        labels = batch["label"].to(device)  # (B,)
+    for batch_idx, (views, labels) in enumerate(pbar):
+        views = views.to(device, non_blocking=True)  # (B, V, C, H, W)
+        labels = labels.to(device, non_blocking=True)  # (B,)
 
-        B, V = images.shape[:2]
+        B, V = views.shape[:2]
 
         # Forward pass with mixed precision
-        with autocast(enabled=config.mixed_precision, dtype=torch.bfloat16):
+        with autocast("cuda", enabled=config.mixed_precision, dtype=torch.bfloat16):
             # Get embeddings and projections
-            embeddings, projections = model(images)  # (B*V, dim)
+            emb, proj = model(views)  # emb: (B*V, D), proj: (V, B, D)
 
             # LeJEPA loss on projections
-            loss_dict = loss_fn(projections, embeddings)
-            loss = loss_dict["loss"]
+            loss_dict = loss_fn(proj)
+            lejepa_loss = loss_dict["loss"]
 
             # Linear probe on embeddings (detached)
-            # Use first view only for probe
-            emb_view0 = embeddings.view(B, V, -1)[:, 0].detach()  # (B, embed_dim)
-            probe_logits = probe(emb_view0)
-            probe_loss = F.cross_entropy(probe_logits, labels)
+            # Labels need to be repeated for all views
+            labels_rep = labels.repeat_interleave(V)
+            probe_logits = probe(emb.detach())
+            probe_loss = F.cross_entropy(probe_logits, labels_rep)
 
-        # Backward pass for main loss
+            # Combined loss
+            loss = lejepa_loss + probe_loss
+
+        # Backward pass
         optimizer.zero_grad()
         scaler.scale(loss).backward()
         scaler.step(optimizer)
-
-        # Backward pass for probe
-        probe_optimizer.zero_grad()
-        scaler.scale(probe_loss).backward()
-        scaler.step(probe_optimizer)
-
         scaler.update()
         scheduler.step()
 
-        # Compute accuracy
+        # Compute accuracy (on first view only)
         with torch.no_grad():
-            pred = probe_logits.argmax(dim=1)
+            emb_view0 = emb.view(B, V, -1)[:, 0]  # (B, D)
+            logits_view0 = probe(emb_view0)
+            pred = logits_view0.argmax(dim=1)
             correct = (pred == labels).sum().item()
             total_correct += correct
             total_samples += B
 
         # Accumulate losses
-        total_loss += loss.item()
+        total_loss += lejepa_loss.item()
         total_sigreg += loss_dict["sigreg_loss"].item()
         total_inv += loss_dict["invariance_loss"].item()
         total_probe_loss += probe_loss.item()
@@ -144,7 +125,7 @@ def train_one_epoch(
         if batch_idx % config.log_interval == 0:
             pbar.set_postfix(
                 {
-                    "loss": f"{loss.item():.4f}",
+                    "loss": f"{lejepa_loss.item():.4f}",
                     "sigreg": f"{loss_dict['sigreg_loss'].item():.4f}",
                     "inv": f"{loss_dict['invariance_loss'].item():.4f}",
                     "acc": f"{100 * total_correct / total_samples:.1f}%",
@@ -164,7 +145,7 @@ def train_one_epoch(
 
 @torch.no_grad()
 def evaluate(
-    model: LeJEPA,
+    model: nn.Module,
     probe: LinearProbe,
     val_loader,
     device: torch.device,
@@ -177,14 +158,14 @@ def evaluate(
     total_correct = 0
     total_samples = 0
 
-    for batch in tqdm(val_loader, desc="Evaluating"):
-        images = batch["image"].to(device)  # (B, C, H, W)
-        labels = batch["label"].to(device)
+    for views, labels in tqdm(val_loader, desc="Evaluating"):
+        views = views.to(device, non_blocking=True)  # (B, 1, C, H, W)
+        labels = labels.to(device, non_blocking=True)
 
         # Get embeddings
-        with autocast(enabled=config.mixed_precision, dtype=torch.bfloat16):
-            embeddings = model.get_embedding(images)
-            logits = probe(embeddings)
+        with autocast("cuda", enabled=config.mixed_precision, dtype=torch.bfloat16):
+            emb, _ = model(views)
+            logits = probe(emb)
 
         pred = logits.argmax(dim=1)
         total_correct += (pred == labels).sum().item()
@@ -202,50 +183,40 @@ def count_parameters(model: nn.Module) -> int:
 def main():
     parser = argparse.ArgumentParser(description="Train LeJEPA with JiT or ViT")
     parser.add_argument("--encoder", type=str, default="jit", choices=["jit", "vit"])
-    parser.add_argument("--epochs", type=int, default=200)
-    parser.add_argument("--batch_size", type=int, default=256)
-    parser.add_argument("--lr", type=float, default=2e-3)
-    parser.add_argument("--lr_probe", type=float, default=1e-3)
-    parser.add_argument("--img_size", type=int, default=128)
-    parser.add_argument("--patch_size", type=int, default=8)
-    parser.add_argument("--embed_dim", type=int, default=512)
-    parser.add_argument("--depth", type=int, default=12)
-    parser.add_argument("--num_heads", type=int, default=8)
-    parser.add_argument("--lambda_sigreg", type=float, default=0.5)
-    parser.add_argument("--warmup_epochs", type=int, default=10)
-    parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--output_dir", type=str, default="outputs")
+    parser.add_argument("--epochs", type=int, default=None)
+    parser.add_argument("--batch_size", type=int, default=None)
+    parser.add_argument("--lr", type=float, default=None)
+    parser.add_argument("--lr_probe", type=float, default=None)
+    parser.add_argument("--img_size", type=int, default=None)
+    parser.add_argument("--patch_size", type=int, default=None)
+    parser.add_argument("--embed_dim", type=int, default=None)
+    parser.add_argument("--depth", type=int, default=None)
+    parser.add_argument("--num_heads", type=int, default=None)
+    parser.add_argument("--lambda_sigreg", type=float, default=None)
+    parser.add_argument("--num_views", type=int, default=None)
+    parser.add_argument("--num_workers", type=int, default=None)
+    parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--output_dir", type=str, default=None)
     parser.add_argument("--use_wandb", action="store_true")
-    parser.add_argument("--wandb_project", type=str, default="lejepa-jit")
+    parser.add_argument("--wandb_project", type=str, default=None)
     args = parser.parse_args()
 
-    # Create config
-    config = get_config(
-        encoder=args.encoder,
-        epochs=args.epochs,
-        batch_size=args.batch_size,
-        lr_encoder=args.lr,
-        lr_probe=args.lr_probe,
-        img_size=args.img_size,
-        patch_size=args.patch_size,
-        embed_dim=args.embed_dim,
-        depth=args.depth,
-        num_heads=args.num_heads,
-        lambda_sigreg=args.lambda_sigreg,
-        warmup_epochs=args.warmup_epochs,
-        num_workers=args.num_workers,
-        seed=args.seed,
-        output_dir=args.output_dir,
-        use_wandb=args.use_wandb,
-        wandb_project=args.wandb_project,
-    )
+    # Create config with overrides
+    overrides = {k: v for k, v in vars(args).items() if v is not None}
+    if "lr" in overrides:
+        overrides["lr_encoder"] = overrides.pop("lr")
+    config = get_config(**overrides)
 
     # Set seed
-    set_seed(config.seed)
+    torch.manual_seed(config.seed)
 
     # Setup device
-    device = torch.device(config.device if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Using device: {device}")
 
     # Create output directory
@@ -282,6 +253,10 @@ def main():
 
     # Create model
     print(f"Creating LeJEPA model with {config.encoder.upper()} encoder...")
+    jit_kwargs = {}
+    if config.encoder == "jit":
+        jit_kwargs["bottleneck_dim"] = config.bottleneck_dim
+
     model = create_lejepa(
         encoder_type=config.encoder,
         img_size=config.img_size,
@@ -289,9 +264,8 @@ def main():
         embed_dim=config.embed_dim,
         depth=config.depth,
         num_heads=config.num_heads,
-        proj_hidden_dim=config.proj_hidden_dim,
         proj_dim=config.proj_dim,
-        bottleneck_dim=config.bottleneck_dim if config.encoder == "jit" else None,
+        **jit_kwargs,
     ).to(device)
 
     # Create linear probe
@@ -300,43 +274,46 @@ def main():
     # Print model info
     print(f"Model parameters: {count_parameters(model):,}")
     print(f"Encoder parameters: {count_parameters(model.encoder):,}")
-    print(f"Projector parameters: {count_parameters(model.projector):,}")
+    print(f"Projector parameters: {count_parameters(model.proj):,}")
     print(f"Probe parameters: {count_parameters(probe):,}")
 
     # Create loss function
     loss_fn = LeJEPALoss(
         lambda_sigreg=config.lambda_sigreg,
-        num_knots=config.sigreg_num_knots,
-        max_t=config.sigreg_max_t,
-        num_views=config.num_views,
+        knots=config.sigreg_num_knots,
     )
 
-    # Create optimizers
-    optimizer = torch.optim.AdamW(
-        model.parameters(),
-        lr=config.lr_encoder,
-        weight_decay=config.weight_decay,
-    )
-
-    probe_optimizer = torch.optim.AdamW(
-        probe.parameters(),
-        lr=config.lr_probe,
-        weight_decay=config.weight_decay,
-    )
+    # Create optimizers with separate weight decay (matching reference)
+    param_groups = [
+        {
+            "params": model.parameters(),
+            "lr": config.lr_encoder,
+            "weight_decay": config.weight_decay_encoder,
+        },
+        {
+            "params": probe.parameters(),
+            "lr": config.lr_probe,
+            "weight_decay": config.weight_decay_probe,
+        },
+    ]
+    optimizer = torch.optim.AdamW(param_groups)
 
     # Create scheduler
-    scheduler = get_lr_scheduler(
-        optimizer,
-        warmup_epochs=config.warmup_epochs,
-        total_epochs=config.epochs,
-        steps_per_epoch=len(train_loader),
-    )
+    warmup_steps = len(train_loader)  # 1 epoch warmup
+    total_steps = len(train_loader) * config.epochs
+    scheduler = get_schedulers(optimizer, warmup_steps, total_steps)
 
     # Create gradient scaler for mixed precision
-    scaler = GradScaler(enabled=config.mixed_precision)
+    scaler = GradScaler(
+        "cuda", enabled=config.mixed_precision and device.type == "cuda"
+    )
 
     # Training loop
     print("\nStarting training...")
+    print(
+        f"Config: epochs={config.epochs}, batch_size={config.batch_size}, "
+        f"num_views={config.num_views}, lambda={config.lambda_sigreg}"
+    )
     best_val_acc = 0
 
     for epoch in range(1, config.epochs + 1):
@@ -348,7 +325,6 @@ def main():
             probe=probe,
             loss_fn=loss_fn,
             optimizer=optimizer,
-            probe_optimizer=probe_optimizer,
             scheduler=scheduler,
             train_loader=train_loader,
             device=device,
@@ -393,6 +369,8 @@ def main():
         print(f"  Time: {epoch_time:.1f}s")
 
         if config.use_wandb:
+            import wandb
+
             wandb.log(
                 {
                     "epoch": epoch,
@@ -437,6 +415,8 @@ def main():
     )
 
     if config.use_wandb:
+        import wandb
+
         wandb.finish()
 
     print(f"\nTraining complete! Models saved to {output_dir}")

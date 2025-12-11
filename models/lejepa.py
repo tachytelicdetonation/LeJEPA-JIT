@@ -7,61 +7,18 @@ The LeJEPA architecture consists of:
 
 The projector maps encoder embeddings to a higher-dimensional space
 where the SIGReg loss is applied.
+
+Matches reference implementation from LeJEPA MINIMAL.md.
 """
 
 from typing import Union
 
 import torch
 import torch.nn as nn
+from torchvision.ops import MLP
 
 from .jit_encoder import JiTEncoder
 from .vit_encoder import ViTEncoder
-
-
-class Projector(nn.Module):
-    """
-    Multi-layer projection head from LeJEPA.
-
-    Maps encoder embeddings through hidden layers to projection space
-    where the SIGReg loss operates.
-    """
-
-    def __init__(
-        self,
-        in_dim: int,
-        hidden_dim: int = 2048,
-        out_dim: int = 2048,
-        num_layers: int = 3,
-    ):
-        super().__init__()
-        layers = []
-
-        # Input layer
-        layers.extend(
-            [
-                nn.Linear(in_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(inplace=True),
-            ]
-        )
-
-        # Hidden layers
-        for _ in range(num_layers - 2):
-            layers.extend(
-                [
-                    nn.Linear(hidden_dim, hidden_dim),
-                    nn.BatchNorm1d(hidden_dim),
-                    nn.ReLU(inplace=True),
-                ]
-            )
-
-        # Output layer (no activation)
-        layers.append(nn.Linear(hidden_dim, out_dim))
-
-        self.net = nn.Sequential(*layers)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
 
 
 class LeJEPA(nn.Module):
@@ -81,59 +38,49 @@ class LeJEPA(nn.Module):
     def __init__(
         self,
         encoder: Union[JiTEncoder, ViTEncoder],
-        proj_hidden_dim: int = 2048,
-        proj_dim: int = 2048,
-        proj_layers: int = 3,
+        proj_dim: int = 128,
     ):
         super().__init__()
         self.encoder = encoder
-        self.projector = Projector(
-            in_dim=encoder.embed_dim,
-            hidden_dim=proj_hidden_dim,
-            out_dim=proj_dim,
-            num_layers=proj_layers,
+        # Use torchvision MLP like reference: 512 -> 2048 -> 2048 -> 128
+        self.proj = MLP(
+            encoder.embed_dim,
+            [2048, 2048, proj_dim],
+            norm_layer=nn.BatchNorm1d,
         )
 
-    def forward(
-        self,
-        x: torch.Tensor,
-        return_embedding: bool = True,
-    ) -> tuple[torch.Tensor, torch.Tensor] | torch.Tensor:
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Forward pass through encoder and projector.
 
         Args:
-            x: (B, C, H, W) or (B, V, C, H, W) for multi-view
-            return_embedding: If True, return both embedding and projection
+            x: (B, V, C, H, W) multi-view input
 
         Returns:
-            If return_embedding:
-                (embedding, projection) - both (B, dim) or (B*V, dim)
-            Else:
-                projection only
+            (emb, proj) where:
+                - emb: (B*V, embed_dim) encoder embeddings
+                - proj: (V, B, proj_dim) projections (views first for loss)
         """
-        # Handle multi-view input
-        if x.dim() == 5:
-            B, V, C, H, W = x.shape
-            x = x.view(B * V, C, H, W)
-        else:
-            pass
+        B, V, C, H, W = x.shape
+
+        # Flatten views into batch dimension
+        x_flat = x.flatten(0, 1)  # (B*V, C, H, W)
 
         # Encoder
-        embedding = self.encoder(x)  # (B*V, embed_dim) or (B, embed_dim)
+        emb = self.encoder(x_flat)  # (B*V, embed_dim)
 
         # Projector
-        projection = self.projector(embedding)  # (B*V, proj_dim) or (B, proj_dim)
+        proj = self.proj(emb)  # (B*V, proj_dim)
 
-        if return_embedding:
-            return embedding, projection
-        return projection
+        # Reshape proj to (V, B, proj_dim) for loss computation
+        proj = proj.reshape(B, V, -1).transpose(0, 1)
+
+        return emb, proj
 
     def get_embedding(self, x: torch.Tensor) -> torch.Tensor:
         """Get only encoder embeddings (for linear probe)."""
         if x.dim() == 5:
-            B, V, C, H, W = x.shape
-            x = x.view(B * V, C, H, W)
+            x = x.flatten(0, 1)
         return self.encoder(x)
 
 
@@ -142,14 +89,18 @@ class LinearProbe(nn.Module):
     Linear classifier for evaluating representation quality.
 
     Trained on frozen embeddings to measure linear separability.
+    Uses LayerNorm before linear layer like reference.
     """
 
     def __init__(self, in_dim: int, num_classes: int):
         super().__init__()
-        self.fc = nn.Linear(in_dim, num_classes)
+        self.net = nn.Sequential(
+            nn.LayerNorm(in_dim),
+            nn.Linear(in_dim, num_classes),
+        )
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.fc(x)
+        return self.net(x)
 
 
 def create_lejepa(
@@ -159,8 +110,7 @@ def create_lejepa(
     embed_dim: int = 512,
     depth: int = 12,
     num_heads: int = 8,
-    proj_hidden_dim: int = 2048,
-    proj_dim: int = 2048,
+    proj_dim: int = 128,
     **kwargs,
 ) -> LeJEPA:
     """
@@ -173,7 +123,6 @@ def create_lejepa(
         embed_dim: Encoder embedding dimension
         depth: Number of transformer layers
         num_heads: Number of attention heads
-        proj_hidden_dim: Projector hidden dimension
         proj_dim: Projector output dimension
         **kwargs: Additional encoder arguments
 
@@ -201,11 +150,7 @@ def create_lejepa(
     else:
         raise ValueError(f"Unknown encoder type: {encoder_type}")
 
-    return LeJEPA(
-        encoder=encoder,
-        proj_hidden_dim=proj_hidden_dim,
-        proj_dim=proj_dim,
-    )
+    return LeJEPA(encoder=encoder, proj_dim=proj_dim)
 
 
 def create_lejepa_small(encoder_type: str = "jit", **kwargs) -> LeJEPA:
