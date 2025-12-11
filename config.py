@@ -27,7 +27,7 @@ class Config:
 
     # Projector
     proj_hidden_dim: int = 2048
-    proj_dim: int = 128  # Reference uses 128
+    proj_dim: int = 16  # Reference uses 16
 
     # Training
     batch_size: int = 128
