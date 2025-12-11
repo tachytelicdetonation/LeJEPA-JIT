@@ -30,7 +30,7 @@ class Config:
     proj_dim: int = 128  # Reference uses 128
 
     # Training
-    batch_size: int = 256
+    batch_size: int = 128
     epochs: int = 800  # Reference uses 800
     lr_encoder: float = 2e-3
     lr_probe: float = 1e-3
