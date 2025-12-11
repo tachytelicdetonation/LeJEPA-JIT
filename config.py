@@ -47,7 +47,7 @@ class Config:
 
     # Dataset
     dataset: str = "frgfm/imagenette"
-    dataset_split: str = "full"  # or "320px", "160px"
+    dataset_config: str = "160px"  # "160px", "320px", or "full"
     num_workers: int = 8
 
     # Device

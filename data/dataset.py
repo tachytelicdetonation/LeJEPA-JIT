@@ -140,8 +140,10 @@ class ImageNetteDataset(Dataset):
         self.img_size = img_size
         self.num_views = num_views
 
-        # Load dataset from HuggingFace
-        self.dataset = load_dataset("frgfm/imagenette", "full", split=split)
+        # Load dataset from HuggingFace (use "160px" config like LeJEPA)
+        self.dataset = load_dataset(
+            "frgfm/imagenette", "160px", split=split, trust_remote_code=True
+        )
 
         # Set up transforms
         if transform is not None:
