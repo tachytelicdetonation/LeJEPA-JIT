@@ -379,7 +379,7 @@ class JiTEncoder(nn.Module):
         grid_size = img_size // patch_size
         head_dim = embed_dim // num_heads
         self.rope = VisionRotaryEmbedding(
-            dim=head_dim // 2,  # Half head_dim since we concat for 2D
+            dim=head_dim,  # Full head_dim; _build_cache handles 2D split
             max_res=grid_size,
         )
 
