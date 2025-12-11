@@ -197,12 +197,15 @@ def main():
     parser.add_argument("--num_workers", type=int, default=None)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output_dir", type=str, default=None)
-    parser.add_argument("--use_wandb", action="store_true")
+    parser.add_argument("--use_wandb", action="store_true", default=None)
+    parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default=None)
     args = parser.parse_args()
 
     # Create config with overrides
-    overrides = {k: v for k, v in vars(args).items() if v is not None}
+    overrides = {k: v for k, v in vars(args).items() if v is not None and k != "no_wandb"}
+    if args.no_wandb:
+        overrides["use_wandb"] = False
     if "lr" in overrides:
         overrides["lr_encoder"] = overrides.pop("lr")
     config = get_config(**overrides)
