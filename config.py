@@ -61,7 +61,7 @@ class Config:
     save_interval: int = 10
     output_dir: str = "outputs"
     wandb_project: str = "lejepa-jit"
-    use_wandb: bool = False
+    use_wandb: bool = True
 
     # Seed
     seed: int = 42
