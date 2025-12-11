@@ -55,9 +55,14 @@ class SIGReg(nn.Module):
         A = A.div_(A.norm(p=2, dim=0))
 
         # Project and compute characteristic function
-        x_t = (proj @ A).unsqueeze(-1) * self.t
-        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
-        statistic = (err @ self.weights) * proj.size(-2)
+        # Ensure buffers are on same device as proj
+        t = self.t.to(proj.device)
+        phi = self.phi.to(proj.device)
+        weights = self.weights.to(proj.device)
+
+        x_t = (proj @ A).unsqueeze(-1) * t
+        err = (x_t.cos().mean(-3) - phi).square() + x_t.sin().mean(-3).square()
+        statistic = (err @ weights) * proj.size(-2)
         return statistic.mean()
 
 
