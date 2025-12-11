@@ -13,7 +13,6 @@ References:
 - LeJEPA: Learning Joint-Embeddings with Prediction Agents
 """
 
-import math
 from typing import Optional
 
 import torch
@@ -105,14 +104,16 @@ class SIGRegLoss(nn.Module):
 
         # Target characteristic function for standard Gaussian: exp(-t^2/2)
         target_phi_real = torch.exp(-0.5 * self.knots**2 * self.target_std**2)
-        target_phi_imag = torch.zeros_like(target_phi_real)
+        torch.zeros_like(target_phi_real)
 
         # Squared difference weighted by quadrature weights
         diff_real = (phi_real - target_phi_real) ** 2
         diff_imag = phi_imag**2  # Should be 0 for symmetric distribution
 
         # Weighted sum over knots
-        loss = (diff_real * self.weights).sum(dim=-1) + (diff_imag * self.weights).sum(dim=-1)
+        loss = (diff_real * self.weights).sum(dim=-1) + (diff_imag * self.weights).sum(
+            dim=-1
+        )
 
         # Average over projections
         loss = loss.mean()
@@ -212,7 +213,10 @@ class LeJEPALoss(nn.Module):
         invariance_loss = self.invariance(projections, self.num_views)
 
         # Combined loss
-        loss = self.lambda_sigreg * sigreg_loss + (1 - self.lambda_sigreg) * invariance_loss
+        loss = (
+            self.lambda_sigreg * sigreg_loss
+            + (1 - self.lambda_sigreg) * invariance_loss
+        )
 
         return {
             "loss": loss,

@@ -15,7 +15,6 @@ Usage:
 """
 
 import argparse
-from pathlib import Path
 
 import torch
 import torch.nn as nn
@@ -23,8 +22,7 @@ import torch.nn.functional as F
 from torch.cuda.amp import autocast
 from tqdm import tqdm
 
-from config import Config
-from models.lejepa import create_lejepa, LinearProbe
+from models.lejepa import create_lejepa
 from data import get_dataloaders
 
 
@@ -78,7 +76,9 @@ def train_linear_probe(
     probe = nn.Linear(embed_dim, num_classes).to(device)
 
     # Optimizer
-    optimizer = torch.optim.SGD(probe.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
+    optimizer = torch.optim.SGD(
+        probe.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4
+    )
     scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
 
     # Training loop
@@ -90,7 +90,7 @@ def train_linear_probe(
         indices = torch.randperm(len(train_features))
 
         for i in range(0, len(train_features), batch_size):
-            batch_idx = indices[i:i + batch_size]
+            batch_idx = indices[i : i + batch_size]
             features = train_features[batch_idx]
             labels = train_labels[batch_idx]
 
@@ -199,7 +199,8 @@ def evaluate_model(
         num_workers=num_workers,
     )
     # Override transform for training set (use val transform for clean features)
-    from data.imagenette import get_val_transform
+    from data import get_val_transform
+
     train_loader.dataset.transform = get_val_transform(config["img_size"])
 
     # Extract features
@@ -243,8 +244,12 @@ def evaluate_model(
 def main():
     parser = argparse.ArgumentParser(description="Evaluate LeJEPA models")
     parser.add_argument("--checkpoint", type=str, help="Path to model checkpoint")
-    parser.add_argument("--checkpoint_jit", type=str, help="Path to JiT model checkpoint")
-    parser.add_argument("--checkpoint_vit", type=str, help="Path to ViT model checkpoint")
+    parser.add_argument(
+        "--checkpoint_jit", type=str, help="Path to JiT model checkpoint"
+    )
+    parser.add_argument(
+        "--checkpoint_vit", type=str, help="Path to ViT model checkpoint"
+    )
     parser.add_argument("--num_workers", type=int, default=8)
     args = parser.parse_args()
 
@@ -273,7 +278,9 @@ def main():
         print(f"{'Encoder':<10} {'Linear Probe':<15} {'k-NN (k=20)':<15}")
         print("-" * 40)
         for r in results:
-            print(f"{r['encoder'].upper():<10} {r['linear_probe_acc']:<15.2f} {r['knn_accs'][20]:<15.2f}")
+            print(
+                f"{r['encoder'].upper():<10} {r['linear_probe_acc']:<15.2f} {r['knn_accs'][20]:<15.2f}"
+            )
 
 
 if __name__ == "__main__":

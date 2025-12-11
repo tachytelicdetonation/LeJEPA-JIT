@@ -17,7 +17,6 @@ Removed (diffusion-specific):
 - FinalLayer denoising head
 """
 
-import math
 from typing import Optional
 
 import torch
@@ -140,7 +139,9 @@ class VisionRotaryEmbedding(nn.Module):
         self.register_buffer("cos_cached", freqs.cos(), persistent=False)
         self.register_buffer("sin_cached", freqs.sin(), persistent=False)
 
-    def forward(self, x: torch.Tensor, seq_len: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, seq_len: int
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Returns cos and sin for rotary embedding.
 
@@ -382,16 +383,18 @@ class JiTEncoder(nn.Module):
         )
 
         # Transformer blocks
-        self.blocks = nn.ModuleList([
-            JiTBlock(
-                dim=embed_dim,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                drop=drop_rate,
-                attn_drop=attn_drop_rate,
-            )
-            for _ in range(depth)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                JiTBlock(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    drop=drop_rate,
+                    attn_drop=attn_drop_rate,
+                )
+                for _ in range(depth)
+            ]
+        )
 
         # Final norm
         self.norm = RMSNorm(embed_dim)

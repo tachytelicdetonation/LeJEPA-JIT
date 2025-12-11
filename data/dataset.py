@@ -17,6 +17,7 @@ from PIL import Image
 
 try:
     from datasets import load_dataset
+
     HF_AVAILABLE = True
 except ImportError:
     HF_AVAILABLE = False
@@ -57,48 +58,55 @@ def get_train_transform(img_size: int = 128) -> transforms.Compose:
     - Solarization
     - Horizontal flip
     """
-    return transforms.Compose([
-        transforms.RandomResizedCrop(
-            img_size,
-            scale=(0.2, 1.0),
-            interpolation=transforms.InterpolationMode.BICUBIC,
-        ),
-        transforms.RandomHorizontalFlip(p=0.5),
-        transforms.RandomApply([
-            transforms.ColorJitter(
-                brightness=0.4,
-                contrast=0.4,
-                saturation=0.2,
-                hue=0.1,
-            )
-        ], p=0.8),
-        transforms.RandomGrayscale(p=0.2),
-        transforms.RandomApply([
-            transforms.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))
-        ], p=0.5),
-        transforms.RandomSolarize(threshold=128, p=0.2),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
-    ])
+    return transforms.Compose(
+        [
+            transforms.RandomResizedCrop(
+                img_size,
+                scale=(0.2, 1.0),
+                interpolation=transforms.InterpolationMode.BICUBIC,
+            ),
+            transforms.RandomHorizontalFlip(p=0.5),
+            transforms.RandomApply(
+                [
+                    transforms.ColorJitter(
+                        brightness=0.4,
+                        contrast=0.4,
+                        saturation=0.2,
+                        hue=0.1,
+                    )
+                ],
+                p=0.8,
+            ),
+            transforms.RandomGrayscale(p=0.2),
+            transforms.RandomApply(
+                [transforms.GaussianBlur(kernel_size=23, sigma=(0.1, 2.0))], p=0.5
+            ),
+            transforms.RandomSolarize(threshold=128, p=0.2),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ]
+    )
 
 
 def get_val_transform(img_size: int = 128) -> transforms.Compose:
     """Standard validation transform (resize + center crop)."""
-    return transforms.Compose([
-        transforms.Resize(
-            int(img_size * 1.14),  # Resize to slightly larger
-            interpolation=transforms.InterpolationMode.BICUBIC,
-        ),
-        transforms.CenterCrop(img_size),
-        transforms.ToTensor(),
-        transforms.Normalize(
-            mean=[0.485, 0.456, 0.406],
-            std=[0.229, 0.224, 0.225],
-        ),
-    ])
+    return transforms.Compose(
+        [
+            transforms.Resize(
+                int(img_size * 1.14),  # Resize to slightly larger
+                interpolation=transforms.InterpolationMode.BICUBIC,
+            ),
+            transforms.CenterCrop(img_size),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225],
+            ),
+        ]
+    )
 
 
 class ImageNetteDataset(Dataset):

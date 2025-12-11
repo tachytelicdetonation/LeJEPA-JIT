@@ -19,7 +19,6 @@ Usage:
 """
 
 import argparse
-import os
 import random
 import time
 from pathlib import Path
@@ -32,7 +31,7 @@ from torch.cuda.amp import GradScaler, autocast
 from tqdm import tqdm
 
 from config import Config, get_config
-from models import LeJEPA, JiTEncoder, ViTEncoder
+from models import LeJEPA
 from models.lejepa import LinearProbe, create_lejepa
 from losses import LeJEPALoss
 from data import get_dataloaders
@@ -143,13 +142,15 @@ def train_one_epoch(
 
         # Update progress bar
         if batch_idx % config.log_interval == 0:
-            pbar.set_postfix({
-                "loss": f"{loss.item():.4f}",
-                "sigreg": f"{loss_dict['sigreg_loss'].item():.4f}",
-                "inv": f"{loss_dict['invariance_loss'].item():.4f}",
-                "acc": f"{100 * total_correct / total_samples:.1f}%",
-                "lr": f"{scheduler.get_last_lr()[0]:.2e}",
-            })
+            pbar.set_postfix(
+                {
+                    "loss": f"{loss.item():.4f}",
+                    "sigreg": f"{loss_dict['sigreg_loss'].item():.4f}",
+                    "inv": f"{loss_dict['invariance_loss'].item():.4f}",
+                    "acc": f"{100 * total_correct / total_samples:.1f}%",
+                    "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                }
+            )
 
     num_batches = len(train_loader)
     return {
@@ -248,7 +249,9 @@ def main():
     print(f"Using device: {device}")
 
     # Create output directory
-    output_dir = Path(config.output_dir) / f"{config.encoder}_{time.strftime('%Y%m%d_%H%M%S')}"
+    output_dir = (
+        Path(config.output_dir) / f"{config.encoder}_{time.strftime('%Y%m%d_%H%M%S')}"
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
     print(f"Output directory: {output_dir}")
 
@@ -256,6 +259,7 @@ def main():
     if config.use_wandb:
         try:
             import wandb
+
             wandb.init(
                 project=config.wandb_project,
                 config=vars(config),
@@ -361,45 +365,57 @@ def main():
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
                 # Save best model
-                torch.save({
-                    "epoch": epoch,
-                    "model_state_dict": model.state_dict(),
-                    "probe_state_dict": probe.state_dict(),
-                    "optimizer_state_dict": optimizer.state_dict(),
-                    "val_accuracy": val_acc,
-                    "config": vars(config),
-                }, output_dir / "best_model.pt")
+                torch.save(
+                    {
+                        "epoch": epoch,
+                        "model_state_dict": model.state_dict(),
+                        "probe_state_dict": probe.state_dict(),
+                        "optimizer_state_dict": optimizer.state_dict(),
+                        "val_accuracy": val_acc,
+                        "config": vars(config),
+                    },
+                    output_dir / "best_model.pt",
+                )
         else:
             val_metrics = {}
 
         # Log metrics
         epoch_time = time.time() - start_time
         print(f"\nEpoch {epoch}/{config.epochs}")
-        print(f"  Loss: {train_metrics['loss']:.4f} (SIGReg: {train_metrics['sigreg_loss']:.4f}, Inv: {train_metrics['invariance_loss']:.4f})")
+        print(
+            f"  Loss: {train_metrics['loss']:.4f} (SIGReg: {train_metrics['sigreg_loss']:.4f}, Inv: {train_metrics['invariance_loss']:.4f})"
+        )
         print(f"  Train Acc: {train_metrics['accuracy']:.2f}%")
         if val_metrics:
-            print(f"  Val Acc: {val_metrics['val_accuracy']:.2f}% (Best: {best_val_acc:.2f}%)")
+            print(
+                f"  Val Acc: {val_metrics['val_accuracy']:.2f}% (Best: {best_val_acc:.2f}%)"
+            )
         print(f"  Time: {epoch_time:.1f}s")
 
         if config.use_wandb:
-            wandb.log({
-                "epoch": epoch,
-                **train_metrics,
-                **val_metrics,
-                "best_val_accuracy": best_val_acc,
-                "lr": scheduler.get_last_lr()[0],
-            })
+            wandb.log(
+                {
+                    "epoch": epoch,
+                    **train_metrics,
+                    **val_metrics,
+                    "best_val_accuracy": best_val_acc,
+                    "lr": scheduler.get_last_lr()[0],
+                }
+            )
 
         # Save checkpoint
         if epoch % config.save_interval == 0:
-            torch.save({
-                "epoch": epoch,
-                "model_state_dict": model.state_dict(),
-                "probe_state_dict": probe.state_dict(),
-                "optimizer_state_dict": optimizer.state_dict(),
-                "scheduler_state_dict": scheduler.state_dict(),
-                "config": vars(config),
-            }, output_dir / f"checkpoint_epoch_{epoch}.pt")
+            torch.save(
+                {
+                    "epoch": epoch,
+                    "model_state_dict": model.state_dict(),
+                    "probe_state_dict": probe.state_dict(),
+                    "optimizer_state_dict": optimizer.state_dict(),
+                    "scheduler_state_dict": scheduler.state_dict(),
+                    "config": vars(config),
+                },
+                output_dir / f"checkpoint_epoch_{epoch}.pt",
+            )
 
     # Final evaluation
     print("\nFinal evaluation...")
@@ -408,14 +424,17 @@ def main():
     print(f"Best Val Accuracy: {best_val_acc:.2f}%")
 
     # Save final model
-    torch.save({
-        "epoch": config.epochs,
-        "model_state_dict": model.state_dict(),
-        "probe_state_dict": probe.state_dict(),
-        "val_accuracy": val_metrics["val_accuracy"],
-        "best_val_accuracy": best_val_acc,
-        "config": vars(config),
-    }, output_dir / "final_model.pt")
+    torch.save(
+        {
+            "epoch": config.epochs,
+            "model_state_dict": model.state_dict(),
+            "probe_state_dict": probe.state_dict(),
+            "val_accuracy": val_metrics["val_accuracy"],
+            "best_val_accuracy": best_val_acc,
+            "config": vars(config),
+        },
+        output_dir / "final_model.pt",
+    )
 
     if config.use_wandb:
         wandb.finish()

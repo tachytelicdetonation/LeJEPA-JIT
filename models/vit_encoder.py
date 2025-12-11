@@ -5,12 +5,10 @@ This implements a standard ViT-Small architecture matching the one used
 in the original LeJEPA paper for fair comparison with JiT encoder.
 """
 
-import math
 from typing import Optional
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from einops import rearrange
 
 
@@ -204,16 +202,18 @@ class ViTEncoder(nn.Module):
         self.pos_drop = nn.Dropout(p=drop_rate)
 
         # Transformer blocks
-        self.blocks = nn.ModuleList([
-            ViTBlock(
-                dim=embed_dim,
-                num_heads=num_heads,
-                mlp_ratio=mlp_ratio,
-                drop=drop_rate,
-                attn_drop=attn_drop_rate,
-            )
-            for _ in range(depth)
-        ])
+        self.blocks = nn.ModuleList(
+            [
+                ViTBlock(
+                    dim=embed_dim,
+                    num_heads=num_heads,
+                    mlp_ratio=mlp_ratio,
+                    drop=drop_rate,
+                    attn_drop=attn_drop_rate,
+                )
+                for _ in range(depth)
+            ]
+        )
 
         # Final norm
         self.norm = nn.LayerNorm(embed_dim)

@@ -14,8 +14,8 @@ from typing import Union
 import torch
 import torch.nn as nn
 
-from .jit_encoder import JiTEncoder, jit_small, jit_base
-from .vit_encoder import ViTEncoder, vit_small, vit_base
+from .jit_encoder import JiTEncoder
+from .vit_encoder import ViTEncoder
 
 
 class Projector(nn.Module):
@@ -37,19 +37,23 @@ class Projector(nn.Module):
         layers = []
 
         # Input layer
-        layers.extend([
-            nn.Linear(in_dim, hidden_dim),
-            nn.BatchNorm1d(hidden_dim),
-            nn.ReLU(inplace=True),
-        ])
+        layers.extend(
+            [
+                nn.Linear(in_dim, hidden_dim),
+                nn.BatchNorm1d(hidden_dim),
+                nn.ReLU(inplace=True),
+            ]
+        )
 
         # Hidden layers
         for _ in range(num_layers - 2):
-            layers.extend([
-                nn.Linear(hidden_dim, hidden_dim),
-                nn.BatchNorm1d(hidden_dim),
-                nn.ReLU(inplace=True),
-            ])
+            layers.extend(
+                [
+                    nn.Linear(hidden_dim, hidden_dim),
+                    nn.BatchNorm1d(hidden_dim),
+                    nn.ReLU(inplace=True),
+                ]
+            )
 
         # Output layer (no activation)
         layers.append(nn.Linear(hidden_dim, out_dim))
@@ -112,9 +116,8 @@ class LeJEPA(nn.Module):
         if x.dim() == 5:
             B, V, C, H, W = x.shape
             x = x.view(B * V, C, H, W)
-            multi_view = True
         else:
-            multi_view = False
+            pass
 
         # Encoder
         embedding = self.encoder(x)  # (B*V, embed_dim) or (B, embed_dim)
