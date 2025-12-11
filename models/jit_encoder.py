@@ -126,11 +126,11 @@ class VisionRotaryEmbedding(nn.Module):
         positions_x = grid_x.flatten().float()
 
         # Compute frequencies for y and x separately
-        # Split dim in half for y and x
-        half_dim = self.dim // 2
+        # Each uses half the frequencies, combined they form dim/2 total
+        half_freqs = len(self.inv_freq) // 2
 
-        freqs_y = torch.outer(positions_y, self.inv_freq[:half_dim])  # (seq, dim/4)
-        freqs_x = torch.outer(positions_x, self.inv_freq[:half_dim])
+        freqs_y = torch.outer(positions_y, self.inv_freq[:half_freqs])  # (seq, dim/4)
+        freqs_x = torch.outer(positions_x, self.inv_freq[:half_freqs])
 
         # Combine y and x frequencies
         freqs = torch.cat([freqs_y, freqs_x], dim=-1)  # (seq, dim/2)
@@ -377,8 +377,9 @@ class JiTEncoder(nn.Module):
 
         # Rotary position embeddings
         grid_size = img_size // patch_size
+        head_dim = embed_dim // num_heads
         self.rope = VisionRotaryEmbedding(
-            dim=embed_dim // num_heads,
+            dim=head_dim // 2,  # Half head_dim since we concat for 2D
             max_res=grid_size,
         )
 
