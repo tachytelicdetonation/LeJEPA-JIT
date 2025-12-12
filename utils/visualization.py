@@ -31,6 +31,22 @@ import matplotlib
 matplotlib.use("Agg")  # Non-interactive backend for server use
 
 
+def _fig_to_pil(fig) -> Image.Image:
+    """
+    Convert a Matplotlib figure to a PIL Image.
+
+    Uses `buffer_rgba()` for newer Matplotlib, with a fallback for older versions.
+    """
+    fig.canvas.draw()
+
+    if hasattr(fig.canvas, "buffer_rgba"):
+        buf = np.asarray(fig.canvas.buffer_rgba())  # (H, W, 4) RGBA
+        return Image.fromarray(buf[..., :3], mode="RGB")
+
+    # Fallback for older Matplotlib
+    return Image.frombytes("RGB", fig.canvas.get_width_height(), fig.canvas.tostring_rgb())
+
+
 @torch.no_grad()
 def compute_pca_projection(embeddings: torch.Tensor) -> torch.Tensor:
     """
@@ -853,10 +869,7 @@ def generate_head_importance_heatmap(
     plt.tight_layout()
 
     # Convert to PIL
-    fig.canvas.draw()
-    img = Image.frombytes(
-        "RGB", fig.canvas.get_width_height(), fig.canvas.tostring_rgb()
-    )
+    img = _fig_to_pil(fig)
     plt.close(fig)
 
     return img
@@ -929,10 +942,7 @@ def generate_token_similarity_heatmap(
 
     plt.tight_layout()
 
-    fig.canvas.draw()
-    img = Image.frombytes(
-        "RGB", fig.canvas.get_width_height(), fig.canvas.tostring_rgb()
-    )
+    img = _fig_to_pil(fig)
     plt.close(fig)
 
     return img
@@ -1021,10 +1031,7 @@ def generate_rsm_across_layers(
     plt.suptitle("Representational Similarity Matrix (RSM) Across Layers")
     plt.tight_layout()
 
-    fig.canvas.draw()
-    img = Image.frombytes(
-        "RGB", fig.canvas.get_width_height(), fig.canvas.tostring_rgb()
-    )
+    img = _fig_to_pil(fig)
     plt.close(fig)
 
     return img
@@ -1092,10 +1099,7 @@ def generate_gradient_flow_heatmap(
     plt.suptitle("Gradient Flow Through Network")
     plt.tight_layout()
 
-    fig.canvas.draw()
-    img = Image.frombytes(
-        "RGB", fig.canvas.get_width_height(), fig.canvas.tostring_rgb()
-    )
+    img = _fig_to_pil(fig)
     plt.close(fig)
 
     return img
@@ -1213,10 +1217,7 @@ def generate_embedding_projection(
 
     plt.tight_layout()
 
-    fig.canvas.draw()
-    img = Image.frombytes(
-        "RGB", fig.canvas.get_width_height(), fig.canvas.tostring_rgb()
-    )
+    img = _fig_to_pil(fig)
     plt.close(fig)
 
     return img
@@ -1428,10 +1429,7 @@ def generate_collapse_monitor(
     plt.suptitle("Representation Collapse Monitor")
     plt.tight_layout()
 
-    fig.canvas.draw()
-    img = Image.frombytes(
-        "RGB", fig.canvas.get_width_height(), fig.canvas.tostring_rgb()
-    )
+    img = _fig_to_pil(fig)
     plt.close(fig)
 
     return img
@@ -1538,10 +1536,7 @@ def generate_training_dashboard(
     plt.suptitle("Training Dynamics Dashboard", fontsize=14)
     plt.tight_layout()
 
-    fig.canvas.draw()
-    img = Image.frombytes(
-        "RGB", fig.canvas.get_width_height(), fig.canvas.tostring_rgb()
-    )
+    img = _fig_to_pil(fig)
     plt.close(fig)
 
     return img

@@ -31,7 +31,7 @@ class Config:
 
     # Training
     batch_size: int = 256
-    epochs: int = 800
+    epochs: int = 100
     lr_encoder: float = 5e-4  # Paper value
     lr_probe: float = 1e-3
     weight_decay_encoder: float = 5e-2
