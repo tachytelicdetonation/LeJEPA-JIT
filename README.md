@@ -34,6 +34,12 @@ This project integrates the JiT architecture from ["Back to Basics: Let Denoisin
 git clone https://github.com/yourusername/LeJEPA-JIT.git
 cd LeJEPA-JIT
 
+# (Recommended) Create virtualenv with uv
+#   https://github.com/astral-sh/uv
+uv venv
+source .venv/bin/activate  # or `.venv\Scripts\activate` on Windows
+uv pip install -r requirements.txt
+
 # Create virtual environment
 python -m venv .venv
 source .venv/bin/activate  # or `.venv\Scripts\activate` on Windows

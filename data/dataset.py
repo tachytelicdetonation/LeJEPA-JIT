@@ -13,30 +13,37 @@ import urllib.request
 from pathlib import Path
 
 import torch
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader, Dataset
 from torchvision.datasets import ImageFolder
 from torchvision.transforms import v2
 
-
 # Dataset URL and paths
-DATA_URL = "https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-160.tgz"
-DATA_DIR = Path("./data/imagenette2-160")
+# Dataset URL and paths
+IMAGENETTE_URL = "https://s3.amazonaws.com/fast-ai-imageclas/imagenette2-160.tgz"
+IMAGENETTE_DIR = Path("./data/imagenette2-160")
+
+IMAGEWOOF_URL = "https://s3.amazonaws.com/fast-ai-imageclas/imagewoof2-160.tgz"
+IMAGEWOOF_DIR = Path("./data/imagewoof2-160")
 
 
-def download_imagenette(data_dir: Path = DATA_DIR) -> Path:
-    """Download and extract ImageNette dataset if not present."""
+def download_dataset(url: str, data_dir: Path) -> Path:
+    """Download and extract dataset if not present."""
     if data_dir.exists():
         return data_dir
 
     data_dir.parent.mkdir(parents=True, exist_ok=True)
-    tgz_path = data_dir.parent / "imagenette2-160.tgz"
+    tgz_path = data_dir.parent / Path(url).name
 
-    print(f"Downloading ImageNette from {DATA_URL}...")
-    urllib.request.urlretrieve(DATA_URL, tgz_path)
+    print(f"Downloading dataset from {url}...")
+    urllib.request.urlretrieve(url, tgz_path)
     print("Download complete. Extracting...")
 
     with tarfile.open(tgz_path, "r:gz") as tar:
-        tar.extractall(data_dir.parent, filter="data")
+        # Python 3.12+ supports `filter=` for safer extraction; older versions don't.
+        try:
+            tar.extractall(data_dir.parent, filter="data")
+        except TypeError:
+            tar.extractall(data_dir.parent)
 
     tgz_path.unlink()  # Remove archive
     print(f"Extracted to {data_dir}")
@@ -150,8 +157,10 @@ class ImageNetteDataset(Dataset):
         self,
         split: str = "train",
         img_size: int = 224,
-        data_dir: Path = DATA_DIR,
+        data_dir: Path = IMAGENETTE_DIR,
+        url: str = IMAGENETTE_URL,
         is_training: bool = True,
+        class_offset: int = 0,
         # Multi-crop params
         local_crops_number: int = 6,
         local_crops_size: int = 96,
@@ -162,15 +171,18 @@ class ImageNetteDataset(Dataset):
         Args:
             split: "train" or "val"
             img_size: Target global image size
-            data_dir: Path to imagenette2-160 directory
+            data_dir: Path to dataset directory
+            url: Download URL if not present
             is_training: Whether to use Multi-Crop augmentation
+            class_offset: Integer to add to all labels (for merging datasets)
         """
         # Ensure dataset is downloaded
-        download_imagenette(data_dir)
+        download_dataset(url, data_dir)
 
         self.split = split
         self.img_size = img_size
         self.is_training = is_training
+        self.class_offset = class_offset
 
         # Map split names
         folder_split = "val" if split == "validation" else split
@@ -217,6 +229,9 @@ class ImageNetteDataset(Dataset):
         if not self.is_training:
             output = output.unsqueeze(0)  # (1, C, H, W)
 
+        # Apply class offset
+        label = label + self.class_offset
+
         return output, label
 
 
@@ -225,43 +240,76 @@ def get_dataloaders(
     img_size: int = 224,
     num_workers: int = 8,
     pin_memory: bool = True,
-    data_dir: Path = DATA_DIR,
+    data_dir: Path = IMAGENETTE_DIR,
     # Multi-crop params
     local_crops_number: int = 6,
     local_crops_size: int = 96,
     local_crops_scale: tuple = (0.05, 0.3),
     global_crops_scale: tuple = (0.3, 1.0),
-) -> tuple[DataLoader, DataLoader]:
+) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
-    Create training and validation dataloaders.
+    Create training and validation dataloaders for combined ImageNette + ImageWoof.
 
     Args:
         batch_size: Batch size
         img_size: Image size (global crop size)
         num_workers: Number of data loading workers
         pin_memory: Pin memory for faster GPU transfer
-        data_dir: Path to dataset
+        data_dir: Ignored (uses IMAGENETTE_DIR and IMAGEWOOF_DIR)
         ... : Multi-crop parameters
 
     Returns:
-        (train_loader, val_loader)
+        (train_loader, val_loader_imagenette, val_loader_imagewoof)
     """
-    train_dataset = ImageNetteDataset(
+    # 1. ImageNette Training
+    train_ds_nette = ImageNetteDataset(
         split="train",
         img_size=img_size,
-        data_dir=data_dir,
+        data_dir=IMAGENETTE_DIR,
+        url=IMAGENETTE_URL,
         is_training=True,
+        class_offset=0,
         local_crops_number=local_crops_number,
         local_crops_size=local_crops_size,
         local_crops_scale=local_crops_scale,
         global_crops_scale=global_crops_scale,
     )
 
-    val_dataset = ImageNetteDataset(
+    # 2. ImageWoof Training (Offset labels by 10)
+    train_ds_woof = ImageNetteDataset(
+        split="train",
+        img_size=img_size,
+        data_dir=IMAGEWOOF_DIR,
+        url=IMAGEWOOF_URL,
+        is_training=True,
+        class_offset=10,
+        local_crops_number=local_crops_number,
+        local_crops_size=local_crops_size,
+        local_crops_scale=local_crops_scale,
+        global_crops_scale=global_crops_scale,
+    )
+
+    # Combined Training Dataset
+    train_dataset = torch.utils.data.ConcatDataset([train_ds_nette, train_ds_woof])
+
+    # 3. ImageNette Validation
+    val_ds_nette = ImageNetteDataset(
         split="val",
         img_size=img_size,
-        data_dir=data_dir,
+        data_dir=IMAGENETTE_DIR,
+        url=IMAGENETTE_URL,
         is_training=False,
+        class_offset=0,
+    )
+
+    # 4. ImageWoof Validation
+    val_ds_woof = ImageNetteDataset(
+        split="val",
+        img_size=img_size,
+        data_dir=IMAGEWOOF_DIR,
+        url=IMAGEWOOF_URL,
+        is_training=False,
+        class_offset=10,  # Maintain offset for consistent evaluation with probe
     )
 
     train_loader = DataLoader(
@@ -273,15 +321,23 @@ def get_dataloaders(
         drop_last=True,
     )
 
-    val_loader = DataLoader(
-        val_dataset,
+    val_loader_nette = DataLoader(
+        val_ds_nette,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=pin_memory,
     )
 
-    return train_loader, val_loader
+    val_loader_woof = DataLoader(
+        val_ds_woof,
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=pin_memory,
+    )
+
+    return train_loader, val_loader_nette, val_loader_woof
 
 
 # ImageNet class ID to name mapping for ImageNette
@@ -299,6 +355,21 @@ CLASS_ID_TO_NAME = {
 }
 
 
+# ImageNet class ID to name mapping for ImageWoof
+CLASS_ID_TO_NAME_WOOF = {
+    "n02086240": "Shih-Tzu",
+    "n02087394": "Rhodesian ridgeback",
+    "n02088364": "Beagle",
+    "n02089973": "English foxhound",
+    "n02093754": "Australian terrier",
+    "n02096294": "Border terrier",
+    "n02099601": "Golden retriever",
+    "n02105641": "Old English sheepdog",
+    "n02111889": "Samoyed",
+    "n02115641": "Dingo",
+}
+
+
 def get_class_names() -> list[str]:
-    """Return ImageNette class names in folder order."""
-    return list(CLASS_ID_TO_NAME.values())
+    """Return ImageNette + ImageWoof class names in folder order."""
+    return list(CLASS_ID_TO_NAME.values()) + list(CLASS_ID_TO_NAME_WOOF.values())

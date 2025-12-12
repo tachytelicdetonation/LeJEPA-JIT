@@ -69,6 +69,17 @@ class Config:
     wandb_project: str = "lejepa-jit"
     use_wandb: bool = True
 
+    # Visualization intervals (default: every epoch)
+    layer_attention_interval: int = 1
+    per_head_attention_interval: int = 1
+    head_importance_interval: int = 1
+    token_similarity_interval: int = 1
+    rsm_interval: int = 1
+    collapse_monitor_interval: int = 1
+    gradient_flow_interval: int = 1
+    training_dashboard_interval: int = 1
+    embedding_projection_interval: int = 1
+
     # Seed
     seed: int = 42
 

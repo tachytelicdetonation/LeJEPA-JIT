@@ -265,6 +265,10 @@ class Attention(nn.Module):
         # Scaled dot-product attention
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
+
+        if getattr(self, "output_attention", False):
+            self.attn_map = attn.detach()
+
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
@@ -486,6 +490,10 @@ class JiTEncoder(nn.Module):
             x = x.mean(dim=1)  # Mean pooling
 
         return x
+
+    def get_attention_maps(self):
+        """Return list of attention maps from all blocks."""
+        return [block.attn.attn_map for block in self.blocks]
 
 
 def jit_small(img_size: int = 128, patch_size: int = 8, **kwargs) -> JiTEncoder:

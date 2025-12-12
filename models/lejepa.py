@@ -39,13 +39,14 @@ class LeJEPA(nn.Module):
         self,
         encoder: Union[JiTEncoder, ViTEncoder],
         proj_dim: int = 128,
+        proj_hidden_dim: int = 2048,
     ):
         super().__init__()
         self.encoder = encoder
         # Use torchvision MLP like reference: 512 -> 2048 -> 2048 -> 128
         self.proj = MLP(
             encoder.embed_dim,
-            [2048, 2048, proj_dim],
+            [proj_hidden_dim, proj_hidden_dim, proj_dim],
             norm_layer=nn.BatchNorm1d,
         )
 
@@ -116,6 +117,7 @@ def create_lejepa(
     embed_dim: int = 512,
     depth: int = 12,
     num_heads: int = 8,
+    proj_hidden_dim: int = 2048,
     proj_dim: int = 128,
     **kwargs,
 ) -> LeJEPA:
@@ -159,7 +161,7 @@ def create_lejepa(
     else:
         raise ValueError(f"Unknown encoder type: {encoder_type}")
 
-    return LeJEPA(encoder=encoder, proj_dim=proj_dim)
+    return LeJEPA(encoder=encoder, proj_dim=proj_dim, proj_hidden_dim=proj_hidden_dim)
 
 
 def create_lejepa_small(encoder_type: str = "jit", **kwargs) -> LeJEPA:

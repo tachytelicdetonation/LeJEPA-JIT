@@ -62,6 +62,9 @@ class Attention(nn.Module):
         proj_drop: float = 0.0,
     ):
         super().__init__()
+        self.output_attention = False
+        self.attn_map = None
+
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
         self.scale = self.head_dim**-0.5
@@ -80,6 +83,10 @@ class Attention(nn.Module):
 
         attn = (q @ k.transpose(-2, -1)) * self.scale
         attn = attn.softmax(dim=-1)
+
+        if getattr(self, "output_attention", False):
+            self.attn_map = attn.detach()
+
         attn = self.attn_drop(attn)
 
         x = (attn @ v).transpose(1, 2).reshape(B, N, C)
@@ -314,6 +321,10 @@ class ViTEncoder(nn.Module):
             x = x.mean(dim=1)  # Mean pooling
 
         return x
+
+    def get_attention_maps(self):
+        """Return list of attention maps from all blocks."""
+        return [block.attn.attn_map for block in self.blocks]
 
 
 def vit_small(img_size: int = 128, patch_size: int = 8, **kwargs) -> ViTEncoder:

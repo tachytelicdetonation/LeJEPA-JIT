@@ -15,15 +15,29 @@ Usage:
 """
 
 import argparse
+from contextlib import nullcontext
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from torch.cuda.amp import autocast
 from tqdm import tqdm
 
 from models.lejepa import create_lejepa
 from data import get_dataloaders
+
+
+def _amp_dtype_for_device(device: torch.device) -> torch.dtype:
+    if device.type == "cuda":
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    if device.type == "mps":
+        return torch.float16
+    return torch.bfloat16
+
+
+def _autocast_ctx(device: torch.device, enabled: bool):
+    if not enabled:
+        return nullcontext()
+    return torch.autocast(device_type=device.type, dtype=_amp_dtype_for_device(device))
 
 
 @torch.no_grad()
@@ -31,6 +45,7 @@ def extract_features(
     model,
     dataloader,
     device: torch.device,
+    mixed_precision: bool = True,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Extract features from all images in dataloader."""
     model.eval()
@@ -38,15 +53,15 @@ def extract_features(
     all_features = []
     all_labels = []
 
-    for batch in tqdm(dataloader, desc="Extracting features"):
-        images = batch["image"].to(device)
-        labels = batch["label"]
+    for views, labels in tqdm(dataloader, desc="Extracting features"):
+        views = views.to(device)
+        labels = labels if torch.is_tensor(labels) else torch.tensor(labels)
 
-        with autocast(dtype=torch.bfloat16):
-            features = model.get_embedding(images)
+        with _autocast_ctx(device, enabled=mixed_precision):
+            features = model.get_embedding(views)
 
         all_features.append(features.cpu())
-        all_labels.append(labels)
+        all_labels.append(labels.cpu())
 
     features = torch.cat(all_features, dim=0)
     labels = torch.cat(all_labels, dim=0)
@@ -153,15 +168,21 @@ def load_model(checkpoint_path: str, device: torch.device):
     config_dict = checkpoint["config"]
 
     # Create model
+    encoder_type = config_dict["encoder"]
+    encoder_kwargs = {}
+    if encoder_type == "jit":
+        encoder_kwargs["bottleneck_dim"] = config_dict.get("bottleneck_dim", 128)
+
     model = create_lejepa(
-        encoder_type=config_dict["encoder"],
+        encoder_type=encoder_type,
         img_size=config_dict["img_size"],
         patch_size=config_dict["patch_size"],
         embed_dim=config_dict["embed_dim"],
         depth=config_dict["depth"],
         num_heads=config_dict["num_heads"],
-        proj_hidden_dim=config_dict["proj_hidden_dim"],
+        proj_hidden_dim=config_dict.get("proj_hidden_dim", 2048),
         proj_dim=config_dict["proj_dim"],
+        **encoder_kwargs,
     )
 
     model.load_state_dict(checkpoint["model_state_dict"])
@@ -183,35 +204,57 @@ def evaluate_model(
     print(f"Encoder: {config['encoder'].upper()}")
     print(f"Embed dim: {config['embed_dim']}")
 
-    # Create dataloaders
-    # We only need validation loader here, which is standard
-    # Pass arbitrary multi-crop params as they won't be used for val split
-    _, val_loader = get_dataloaders(
+    # Create dataloaders (matches training pipeline: ImageNette + ImageWoof)
+    _, val_loader_nette, val_loader_woof = get_dataloaders(
         batch_size=256,
         img_size=config["img_size"],
         num_workers=num_workers,
     )
 
-    # For linear probe training, we need training features too
-    # We want standard transform (resize/center crop) for feature extraction
-    # So we initialize as if it's validation set or override transform manually as before
-    # But get_dataloaders now creates ImageNetteDataset which handles is_training logic internally.
-    # To get training data with validation transform:
-    # 1. Instantiate dataset manually OR
-    # 2. Use same trick: get_dataloaders with 'train' split but override transform
-
-    # Let's instantiate dataset manually for cleaner control
+    # For linear probe training, we want a standard (non-multicrop) transform.
+    # Build a combined train dataset (ImageNette + ImageWoof) with val transforms.
     from data import ImageNetteDataset
     from torch.utils.data import DataLoader
+    import torch.utils.data
 
-    train_dataset = ImageNetteDataset(
+    train_dataset_nette = ImageNetteDataset(
         split="train",
         img_size=config["img_size"],
         is_training=False,  # Use validation transform
+        class_offset=0,
+    )
+
+    # The ImageNetteDataset constructor already has defaults for ImageWoof via args in get_dataloaders,
+    # so we mirror that explicitly here to keep labels aligned.
+    from data.dataset import IMAGEWOOF_DIR, IMAGEWOOF_URL
+
+    train_dataset_woof = ImageNetteDataset(
+        split="train",
+        img_size=config["img_size"],
+        data_dir=IMAGEWOOF_DIR,
+        url=IMAGEWOOF_URL,
+        is_training=False,
+        class_offset=10,
+    )
+
+    train_dataset_combined = torch.utils.data.ConcatDataset(
+        [train_dataset_nette, train_dataset_woof]
     )
 
     train_loader = DataLoader(
-        train_dataset,
+        train_dataset_combined,
+        batch_size=256,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
+
+    # Combined val set (20 classes)
+    val_dataset_combined = torch.utils.data.ConcatDataset(
+        [val_loader_nette.dataset, val_loader_woof.dataset]
+    )
+    val_loader = DataLoader(
+        val_dataset_combined,
         batch_size=256,
         shuffle=False,
         num_workers=num_workers,
@@ -220,10 +263,12 @@ def evaluate_model(
 
     # Extract features
     print("Extracting training features...")
-    train_features, train_labels = extract_features(model, train_loader, device)
+    train_features, train_labels = extract_features(
+        model, train_loader, device, mixed_precision=True
+    )
 
     print("Extracting validation features...")
-    val_features, val_labels = extract_features(model, val_loader, device)
+    val_features, val_labels = extract_features(model, val_loader, device, mixed_precision=True)
 
     print(f"Train features shape: {train_features.shape}")
     print(f"Val features shape: {val_features.shape}")
@@ -235,7 +280,7 @@ def evaluate_model(
         train_labels,
         val_features,
         val_labels,
-        num_classes=10,
+        num_classes=20,
         epochs=100,
         device=device,
     )
@@ -268,7 +313,12 @@ def main():
     parser.add_argument("--num_workers", type=int, default=8)
     args = parser.parse_args()
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+    elif torch.backends.mps.is_available():
+        device = torch.device("mps")
+    else:
+        device = torch.device("cpu")
     print(f"Using device: {device}")
 
     results = []

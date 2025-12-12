@@ -214,3 +214,7 @@ ref/
 
 # Downloaded datasets
 data/imagenette*/
+data/imagewoof*/
+
+# macOS
+.DS_Store
