@@ -42,14 +42,6 @@ source .venv/bin/activate  # or `.venv\Scripts\activate` on Windows
 pip install -r requirements.txt
 ```
 
-## Hardware Requirements
-
-> [!CAUTION] 
-> **VRAM Usage Warning**
-> Due to Multi-Crop augmentation (8 views per image), memory usage is significantly higher than standard training.
-> - **Recommended**: 24GB+ VRAM (RTX 3090/4090, A10G) for batch size 256.
-> - **Minimum**: 16GB VRAM (T4) with reduced batch size (e.g., `--batch_size 128`).
-
 ## Usage
 
 ### Training
