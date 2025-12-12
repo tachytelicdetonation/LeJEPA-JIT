@@ -114,30 +114,31 @@ class VisionRotaryEmbedding(nn.Module):
         # Precompute position indices for 2D
         self._build_cache(max_res)
 
-    def _build_cache(self, resolution: int):
-        """Build cos/sin cache for given resolution."""
-        # Create 2D position grid
-        y_pos = torch.arange(resolution)
-        x_pos = torch.arange(resolution)
+    def _compute_embeddings(
+        self, h: int, w: int, device: torch.device, dtype: torch.dtype
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Compute RoPE embeddings for specific resolution."""
+        y_pos = torch.arange(h, device=device)
+        x_pos = torch.arange(w, device=device)
         grid_y, grid_x = torch.meshgrid(y_pos, x_pos, indexing="ij")
 
-        # Flatten to sequence
-        positions_y = grid_y.flatten().float()  # (resolution^2,)
+        positions_y = grid_y.flatten().float()
         positions_x = grid_x.flatten().float()
 
-        # Compute frequencies for y and x separately
-        # Each uses half the frequencies, combined they form dim/2 total
         half_freqs = len(self.inv_freq) // 2
-
-        freqs_y = torch.outer(positions_y, self.inv_freq[:half_freqs])  # (seq, dim/4)
+        freqs_y = torch.outer(positions_y, self.inv_freq[:half_freqs])
         freqs_x = torch.outer(positions_x, self.inv_freq[:half_freqs])
 
-        # Combine y and x frequencies
-        freqs = torch.cat([freqs_y, freqs_x], dim=-1)  # (seq, dim/2)
+        freqs = torch.cat([freqs_y, freqs_x], dim=-1)
+        return freqs.cos().to(dtype), freqs.sin().to(dtype)
 
-        # Create cos and sin embeddings
-        self.register_buffer("cos_cached", freqs.cos(), persistent=False)
-        self.register_buffer("sin_cached", freqs.sin(), persistent=False)
+    def _build_cache(self, resolution: int):
+        """Build cos/sin cache for given resolution."""
+        cos, sin = self._compute_embeddings(
+            resolution, resolution, self.inv_freq.device, torch.float32
+        )
+        self.register_buffer("cos_cached", cos, persistent=False)
+        self.register_buffer("sin_cached", sin, persistent=False)
 
     def forward(
         self, x: torch.Tensor, seq_len: int
@@ -146,16 +147,27 @@ class VisionRotaryEmbedding(nn.Module):
         Returns cos and sin for rotary embedding.
 
         Args:
-            x: Input tensor (for device/dtype)
-            seq_len: Sequence length (num_patches)
-
-        Returns:
-            (cos, sin) each of shape (seq_len, dim/2)
+           seq_len: Number of patches
         """
-        return (
-            self.cos_cached[:seq_len].to(x.dtype),
-            self.sin_cached[:seq_len].to(x.dtype),
-        )
+        # Infer grid size from seq_len (assuming square)
+        res = int(seq_len**0.5)
+        if res * res != seq_len:
+            # Fallback/Error if not square? Or handle linear?
+            # For now assume square as LeJEPA uses square crops
+            pass
+
+        # Check if cached matches
+        if self.cos_cached.shape[0] == seq_len:
+            return (
+                self.cos_cached.to(x.dtype),
+                self.sin_cached.to(x.dtype),
+            )
+
+        # Determine if we can just slice (only if res matches max_res, unlikely for different scales)
+        # Actually simplest is to just recompute if different.
+        # Caching optimization: we could cache by resolution, but simple compute is fast enough probably.
+
+        return self._compute_embeddings(res, res, x.device, x.dtype)
 
 
 def apply_rotary_emb(
@@ -413,13 +425,15 @@ class JiTEncoder(nn.Module):
             if m.bias is not None:
                 nn.init.constant_(m.bias, 0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(self, x: torch.Tensor, return_last_two: bool = False) -> torch.Tensor:
         """
         Args:
             x: (B, C, H, W) input images
+            return_last_two: Whether to return concat of last 2 layers
 
         Returns:
-            (B, embed_dim) pooled representations
+            (B, embed_dim) if return_last_two=False
+            (B, embed_dim * 2) if return_last_two=True
         """
         B = x.shape[0]
 
@@ -433,20 +447,37 @@ class JiTEncoder(nn.Module):
 
         # Get rotary embeddings
         seq_len = x.shape[1]
+
+        # Calculate actual num patches (excluding CLS if present)
+        current_num_patches = seq_len - 1 if self.pool == "cls" else seq_len
+
+        # Get RoPE for this specific resolution
+        rope_cos, rope_sin = self.rope(x, current_num_patches)
+
         if self.pool == "cls":
-            # For CLS, we need to handle the extra token
-            rope_cos, rope_sin = self.rope(x, self.num_patches)
             # Pad for CLS token (no rotation for CLS)
             rope_cos = F.pad(rope_cos, (0, 0, 1, 0), value=1.0)
             rope_sin = F.pad(rope_sin, (0, 0, 1, 0), value=0.0)
-        else:
-            rope_cos, rope_sin = self.rope(x, seq_len)
 
         # Apply transformer blocks
-        for block in self.blocks:
+        output_tokens = []
+        for i, block in enumerate(self.blocks):
             x = block(x, rope_cos, rope_sin)
+            if i >= len(self.blocks) - 2:
+                output_tokens.append(x)
 
         x = self.norm(x)
+
+        # Return last 2 layers
+        if return_last_two and self.pool == "cls":
+            # Normalize both outputs based on final norm logic (approximation, usually norm applies at end)
+            # But here we applied norm at end of block sequence.
+            # To match "CLS token from last two layers + LayerNorm", we should ideally take block outputs, Norm them, then Concat.
+            # The existing code applied norm ONLY at the very end.
+            # Let's apply self.norm to the second-to-last output too for consistency.
+            out1 = self.norm(output_tokens[0])[:, 0]
+            out2 = x[:, 0]  # Output of last block + norm
+            return torch.cat([out1, out2], dim=-1)
 
         # Pool to get final representation
         if self.pool == "cls":

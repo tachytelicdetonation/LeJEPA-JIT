@@ -58,7 +58,7 @@ class LeJEPA(nn.Module):
 
         Returns:
             (emb, proj) where:
-                - emb: (B*V, embed_dim) encoder embeddings
+                - emb: (B*V, embed_dim * 2) encoder embeddings (last 2 layers)
                 - proj: (V, B, proj_dim) projections (views first for loss)
         """
         B, V, C, H, W = x.shape
@@ -66,11 +66,16 @@ class LeJEPA(nn.Module):
         # Flatten views into batch dimension
         x_flat = x.flatten(0, 1)  # (B*V, C, H, W)
 
-        # Encoder
-        emb = self.encoder(x_flat)  # (B*V, embed_dim)
+        # Encoder - Get features from last 2 layers
+        # Returns (B*V, embed_dim * 2) where first half is layer N-1, second half is layer N
+        emb = self.encoder(x_flat, return_last_two=True)
 
-        # Projector
-        proj = self.proj(emb)  # (B*V, proj_dim)
+        # Extract last layer for projector (second half)
+        embed_dim = emb.shape[1] // 2
+        last_layer_emb = emb[:, embed_dim:]
+
+        # Projector uses last layer
+        proj = self.proj(last_layer_emb)  # (B*V, proj_dim)
 
         # Reshape proj to (V, B, proj_dim) for loss computation
         proj = proj.reshape(B, V, -1).transpose(0, 1)
@@ -81,7 +86,8 @@ class LeJEPA(nn.Module):
         """Get only encoder embeddings (for linear probe)."""
         if x.dim() == 5:
             x = x.flatten(0, 1)
-        return self.encoder(x)
+        # Paper uses last 2 layers concatenated
+        return self.encoder(x, return_last_two=True)
 
 
 class LinearProbe(nn.Module):
@@ -126,9 +132,12 @@ def create_lejepa(
         proj_dim: Projector output dimension
         **kwargs: Additional encoder arguments
 
-    Returns:
-        LeJEPA model
+    Defaults to pool="cls" for paper compliance (required for proper feature concatenation).
     """
+    # Force pool="cls" if not specified
+    if "pool" not in kwargs:
+        kwargs["pool"] = "cls"
+
     if encoder_type == "jit":
         encoder = JiTEncoder(
             img_size=img_size,

@@ -75,26 +75,59 @@ def train_one_epoch(
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
 
-    for batch_idx, (views, labels) in enumerate(pbar):
-        views = views.to(device, non_blocking=True)  # (B, V, C, H, W)
-        labels = labels.to(device, non_blocking=True)  # (B,)
+    for batch_idx, (crops, labels) in enumerate(pbar):
+        # crops is a list of [global1, global2, local1, ..., local6]
+        # Move all crops to device
+        crops = [c.to(device, non_blocking=True) for c in crops]
+        labels = labels.to(device, non_blocking=True)
 
-        B, V = views.shape[:2]
+        # Split into global and local
+        global_crops = crops[:2]
+        local_crops = crops[2:]
+
+        B = labels.shape[0]
 
         # Forward pass with mixed precision
         with autocast("cuda", enabled=config.mixed_precision, dtype=torch.bfloat16):
-            # Get embeddings and projections
-            emb, proj = model(views)  # emb: (B*V, D), proj: (V, B, D)
+            # 1. Forward Global Views
+            global_crops_tensor = torch.stack(
+                global_crops, dim=1
+            )  # (B, 2, C, 224, 224)
+            emb_global, proj_global = model(
+                global_crops_tensor
+            )  # emb: (B*2, D), proj: (2, B, D)
 
-            # LeJEPA loss on projections
+            # 2. Forward Local Views
+            if local_crops:
+                local_crops_tensor = torch.stack(
+                    local_crops, dim=1
+                )  # (B, 6, C, 96, 96)
+                emb_local, proj_local = model(
+                    local_crops_tensor
+                )  # emb: (B*6, D), proj: (6, B, D)
+
+                # Concatenate projections (Views, B, D)
+                proj = torch.cat([proj_global, proj_local], dim=0)  # (8, B, D)
+
+                # Combine embeddings for probe??
+                # Usually probe only on global views or specific view.
+                # Let's keep probe on all views IF we want strict monitoring, but paper only monitors global?
+                # Minimal example monitored (B*V). Let's monitor Global only to be safe/stable.
+                emb_for_probe = emb_global
+                labels_for_probe = labels.repeat_interleave(2)
+            else:
+                proj = proj_global
+                emb_for_probe = emb_global
+                labels_for_probe = labels.repeat_interleave(2)
+
+            # LeJEPA loss on all projections
             loss_dict = loss_fn(proj)
             lejepa_loss = loss_dict["loss"]
 
-            # Linear probe on embeddings (detached)
-            # Labels need to be repeated for all views
-            labels_rep = labels.repeat_interleave(V)
-            probe_logits = probe(emb.detach())
-            probe_loss = F.cross_entropy(probe_logits, labels_rep)
+            # Linear probe on Global embeddings (detached)
+            # Labels need to be repeated for global views
+            probe_logits = probe(emb_for_probe.detach())
+            probe_loss = F.cross_entropy(probe_logits, labels_for_probe)
 
             # Combined loss
             loss = lejepa_loss + probe_loss
@@ -106,9 +139,9 @@ def train_one_epoch(
         scaler.update()
         scheduler.step()
 
-        # Compute accuracy (on first view only)
+        # Compute accuracy (on first global view only)
         with torch.no_grad():
-            emb_view0 = emb.view(B, V, -1)[:, 0]  # (B, D)
+            emb_view0 = emb_global.view(B, 2, -1)[:, 0]  # (B, D)
             logits_view0 = probe(emb_view0)
             pred = logits_view0.argmax(dim=1)
             correct = (pred == labels).sum().item()
@@ -121,7 +154,7 @@ def train_one_epoch(
         total_inv += loss_dict["invariance_loss"].item()
         total_probe_loss += probe_loss.item()
 
-        # Update progress bar
+        # Update progress bar and log to wandb
         if batch_idx % config.log_interval == 0:
             pbar.set_postfix(
                 {
@@ -132,6 +165,22 @@ def train_one_epoch(
                     "lr": f"{scheduler.get_last_lr()[0]:.2e}",
                 }
             )
+            # Log batch metrics to wandb
+            if config.use_wandb:
+                import wandb
+
+                global_step = (epoch - 1) * len(train_loader) + batch_idx
+                wandb.log(
+                    {
+                        "step": global_step,
+                        "train/loss": lejepa_loss.item(),
+                        "train/sigreg": loss_dict["sigreg_loss"].item(),
+                        "train/invariance": loss_dict["invariance_loss"].item(),
+                        "train/probe_loss": probe_loss.item(),
+                        "train/accuracy": 100 * total_correct / total_samples,
+                        "train/lr": scheduler.get_last_lr()[0],
+                    }
+                )
 
     num_batches = len(train_loader)
     return {
@@ -203,7 +252,9 @@ def main():
     args = parser.parse_args()
 
     # Create config with overrides
-    overrides = {k: v for k, v in vars(args).items() if v is not None and k != "no_wandb"}
+    overrides = {
+        k: v for k, v in vars(args).items() if v is not None and k != "no_wandb"
+    }
     if args.no_wandb:
         overrides["use_wandb"] = False
     if "lr" in overrides:
@@ -239,6 +290,12 @@ def main():
                 config=vars(config),
                 name=f"{config.encoder}-{time.strftime('%Y%m%d_%H%M%S')}",
             )
+            # Define x-axes for different metric types
+            wandb.define_metric("step")
+            wandb.define_metric("epoch")
+            wandb.define_metric("train/*", step_metric="step")
+            wandb.define_metric("epoch_*", step_metric="epoch")
+            wandb.define_metric("val_*", step_metric="epoch")
         except ImportError:
             print("wandb not installed, skipping logging")
             config.use_wandb = False
@@ -248,8 +305,11 @@ def main():
     train_loader, val_loader = get_dataloaders(
         batch_size=config.batch_size,
         img_size=config.img_size,
-        num_views=config.num_views,
         num_workers=config.num_workers,
+        local_crops_number=config.local_crops_number,
+        local_crops_size=config.local_crops_size,
+        local_crops_scale=config.local_crops_scale,
+        global_crops_scale=config.global_crops_scale,
     )
     print(f"Train samples: {len(train_loader.dataset)}")
     print(f"Val samples: {len(val_loader.dataset)}")
@@ -272,7 +332,10 @@ def main():
     ).to(device)
 
     # Create linear probe
-    probe = LinearProbe(config.embed_dim, num_classes=10).to(device)
+    # Online probe monitors training convergence using standard embeddings (last layer)
+    # Full evaluation uses concatenated features (last 2 layers)
+    # We update online probe to also use concatenated features to match paper protocol
+    probe = LinearProbe(config.embed_dim * 2, num_classes=10).to(device)
 
     # Print model info
     print(f"Model parameters: {count_parameters(model):,}")
@@ -377,10 +440,13 @@ def main():
             wandb.log(
                 {
                     "epoch": epoch,
-                    **train_metrics,
-                    **val_metrics,
+                    "epoch_loss": train_metrics["loss"],
+                    "epoch_sigreg_loss": train_metrics["sigreg_loss"],
+                    "epoch_invariance_loss": train_metrics["invariance_loss"],
+                    "epoch_probe_loss": train_metrics["probe_loss"],
+                    "epoch_train_accuracy": train_metrics["accuracy"],
+                    **{f"val_{k}": v for k, v in val_metrics.items()},
                     "best_val_accuracy": best_val_acc,
-                    "lr": scheduler.get_last_lr()[0],
                 }
             )
 
@@ -420,6 +486,9 @@ def main():
     if config.use_wandb:
         import wandb
 
+        # Log summary metrics for easy comparison in runs table
+        wandb.run.summary["best_val_accuracy"] = best_val_acc
+        wandb.run.summary["final_val_accuracy"] = val_metrics["val_accuracy"]
         wandb.finish()
 
     print(f"\nTraining complete! Models saved to {output_dir}")

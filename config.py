@@ -10,14 +10,14 @@ class Config:
     encoder: Literal["jit", "vit"] = "jit"
 
     # Image and patch settings
-    img_size: int = 128
-    patch_size: int = 8
+    img_size: int = 224
+    patch_size: int = 16  # Standard ViT/16
     in_channels: int = 3
 
     # Encoder architecture
-    embed_dim: int = 512
+    embed_dim: int = 384  # ViT-Small
     depth: int = 12
-    num_heads: int = 8
+    num_heads: int = 6
     mlp_ratio: float = 4.0
 
     # JiT-specific
@@ -30,17 +30,23 @@ class Config:
     proj_dim: int = 16  # Reference uses 16
 
     # Training
-    batch_size: int = 64
-    epochs: int = 800  # Reference uses 800
-    lr_encoder: float = 2e-3
+    batch_size: int = 256
+    epochs: int = 800
+    lr_encoder: float = 5e-4  # Paper value
     lr_probe: float = 1e-3
-    weight_decay_encoder: float = 5e-2  # Reference uses 5e-2
-    weight_decay_probe: float = 1e-7  # Reference uses 1e-7
-    warmup_epochs: int = 1  # 1 epoch warmup
+    weight_decay_encoder: float = 5e-2
+    weight_decay_probe: float = 1e-7
+    warmup_epochs: int = 15
 
     # Loss
-    lambda_sigreg: float = 0.02  # Reference uses 0.02
-    num_views: int = 4  # Reference uses 4 views
+    lambda_sigreg: float = 0.02
+    num_views: int = 8  # 2 Global + 6 Local (Updated)
+
+    # Multi-Crop Parameters
+    local_crops_number: int = 6
+    local_crops_size: int = 96
+    local_crops_scale: tuple = (0.05, 0.4)
+    global_crops_scale: tuple = (0.4, 1.0)
 
     # SIGReg parameters
     sigreg_num_knots: int = 17

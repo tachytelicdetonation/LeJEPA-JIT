@@ -184,24 +184,39 @@ def evaluate_model(
     print(f"Embed dim: {config['embed_dim']}")
 
     # Create dataloaders
+    # We only need validation loader here, which is standard
+    # Pass arbitrary multi-crop params as they won't be used for val split
     _, val_loader = get_dataloaders(
         batch_size=256,
         img_size=config["img_size"],
-        num_views=1,
         num_workers=num_workers,
     )
 
     # For linear probe training, we need training features too
-    train_loader, _ = get_dataloaders(
-        batch_size=256,
-        img_size=config["img_size"],
-        num_views=1,  # Single view for feature extraction
-        num_workers=num_workers,
-    )
-    # Override transform for training set (use val transform for clean features)
-    from data import get_val_transform
+    # We want standard transform (resize/center crop) for feature extraction
+    # So we initialize as if it's validation set or override transform manually as before
+    # But get_dataloaders now creates ImageNetteDataset which handles is_training logic internally.
+    # To get training data with validation transform:
+    # 1. Instantiate dataset manually OR
+    # 2. Use same trick: get_dataloaders with 'train' split but override transform
 
-    train_loader.dataset.transform = get_val_transform(config["img_size"])
+    # Let's instantiate dataset manually for cleaner control
+    from data import ImageNetteDataset
+    from torch.utils.data import DataLoader
+
+    train_dataset = ImageNetteDataset(
+        split="train",
+        img_size=config["img_size"],
+        is_training=False,  # Use validation transform
+    )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=256,
+        shuffle=False,
+        num_workers=num_workers,
+        pin_memory=True,
+    )
 
     # Extract features
     print("Extracting training features...")

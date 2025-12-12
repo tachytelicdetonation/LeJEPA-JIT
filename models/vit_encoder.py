@@ -234,15 +234,44 @@ class ViTEncoder(nn.Module):
             nn.init.constant_(m.bias, 0)
             nn.init.constant_(m.weight, 1.0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def interpolate_pos_encoding(self, x, w, h):
+        npatch = x.shape[1] - 1
+        N = self.pos_embed.shape[1] - 1
+        if npatch == N and w == h:
+            return self.pos_embed
+        class_pos_embed = self.pos_embed[:, 0]
+        patch_pos_embed = self.pos_embed[:, 1:]
+        dim = x.shape[-1]
+        w0 = w // self.patch_embed.patch_size
+        h0 = h // self.patch_embed.patch_size
+        # we add a small number to avoid floating point error in the interpolation
+        # see discussion at https://github.com/facebookresearch/dino/issues/8
+        w0, h0 = w0 + 0.1, h0 + 0.1
+        patch_pos_embed = nn.functional.interpolate(
+            patch_pos_embed.reshape(1, int(N**0.5), int(N**0.5), dim).permute(
+                0, 3, 1, 2
+            ),
+            scale_factor=(w0 / (N**0.5), h0 / (N**0.5)),
+            mode="bicubic",
+        )
+        assert (
+            int(w0) == patch_pos_embed.shape[-2]
+            and int(h0) == patch_pos_embed.shape[-1]
+        )
+        patch_pos_embed = patch_pos_embed.permute(0, 2, 3, 1).view(1, -1, dim)
+        return torch.cat((class_pos_embed.unsqueeze(0), patch_pos_embed), dim=1)
+
+    def forward(self, x: torch.Tensor, return_last_two: bool = False) -> torch.Tensor:
         """
         Args:
             x: (B, C, H, W) input images
+            return_last_two: Whether to return concat of last 2 layers
 
         Returns:
-            (B, embed_dim) pooled representations
+            (B, embed_dim) if return_last_two=False
+            (B, embed_dim * 2) if return_last_two=True
         """
-        B = x.shape[0]
+        B, C, H, W = x.shape
 
         # Patch embedding
         x = self.patch_embed(x)  # (B, num_patches, embed_dim)
@@ -252,17 +281,33 @@ class ViTEncoder(nn.Module):
             cls_tokens = self.cls_token.expand(B, -1, -1)
             x = torch.cat([cls_tokens, x], dim=1)
 
-        # Add positional embeddings
-        x = x + self.pos_embed
+            # Interpolate positional embeddings
+            pos_embed = self.interpolate_pos_encoding(x, W, H)
+            x = x + pos_embed
+        else:
+            # Standard handling without CLS (not fully updated for variable size + mean pool here based on snippet logic but focusing on CLS for Paper compat)
+            # Assuming CLS usage for paper comparison as per README "CLS token from last two layers"
+            x = x + self.pos_embed
+
         x = self.pos_drop(x)
 
         # Apply transformer blocks
-        for block in self.blocks:
+        output_tokens = []
+        for i, block in enumerate(self.blocks):
             x = block(x)
+            # Store last 2 layers
+            if i >= len(self.blocks) - 2:
+                output_tokens.append(x)
 
         x = self.norm(x)
 
         # Pool to get final representation
+        if return_last_two and self.pool == "cls":
+            # Normalize both outputs before concatenating
+            out1 = self.norm(output_tokens[0])[:, 0]
+            out2 = self.norm(output_tokens[1])[:, 0]  # This is technically x[:,0]
+            return torch.cat([out1, out2], dim=-1)
+
         if self.pool == "cls":
             x = x[:, 0]  # CLS token
         else:
