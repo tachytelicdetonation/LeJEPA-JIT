@@ -4,6 +4,10 @@ from utils.metrics import (
     GSNRTracker,
     compute_attention_rank,
     compute_batch_gsnr,
+    compute_linear_cka,
+    compute_alignment_metrics,
+    compute_covariance_metrics,
+    compute_global_norms,
     compute_entropy,
     compute_feature_collapse_metrics,
     compute_gini,
@@ -40,6 +44,7 @@ from utils.visualization import (
     generate_collapse_monitor,
     # New: Training dashboard
     generate_training_dashboard,
+    generate_embedding_spectrum,
 )
 
 __all__ = [
@@ -54,6 +59,10 @@ __all__ = [
     "compute_attention_rank",
     "compute_representation_stats",
     "compute_feature_collapse_metrics",
+    "compute_alignment_metrics",
+    "compute_covariance_metrics",
+    "compute_global_norms",
+    "compute_linear_cka",
     "GSNRTracker",
     # Original Visualization
     "generate_pca_visualization",
@@ -70,5 +79,6 @@ __all__ = [
     "generate_embedding_projection",
     "generate_collapse_monitor",
     "generate_training_dashboard",
+    "generate_embedding_spectrum",
     "AttentionTracker",
 ]

@@ -421,6 +421,224 @@ def compute_attention_rank(attn_probs: torch.Tensor, threshold: float = 0.01) ->
     }
 
 
+def compute_attention_structure_metrics(attn_probs: torch.Tensor) -> dict:
+    """
+    Transformer attention structure diagnostics.
+
+    These help detect "attention sinks" (CLS gathering mass),
+    overly self-focused attention (high diagonal), and head imbalance.
+    """
+    if attn_probs is None or attn_probs.ndim != 4:
+        return {
+            "diag_mass": 0.0,
+            "cls_to_patches": 0.0,
+            "cls_self": 0.0,
+            "patches_to_cls": 0.0,
+            "head_entropy_std": 0.0,
+        }
+
+    B, H, N, _ = attn_probs.shape
+    device = attn_probs.device
+
+    # Diagonal mass: average attention to self (over all query tokens)
+    idx = torch.arange(N, device=device)
+    diag = attn_probs[:, :, idx, idx]  # (B, H, N)
+    diag_mass = diag.mean().item()
+
+    # Head entropy variability (imbalance/redundancy proxy)
+    eps = 1e-8
+    ent = -(attn_probs * torch.log(attn_probs + eps)).sum(dim=-1).mean(dim=-1)  # (B,H)
+    head_entropy_std = ent.std(dim=1).mean().item()
+
+    # CLS-related metrics if CLS token exists (assume index 0)
+    cls_to_patches = 0.0
+    cls_self = 0.0
+    patches_to_cls = 0.0
+    if N >= 2:
+        cls_self = attn_probs[:, :, 0, 0].mean().item()
+        cls_to_patches = attn_probs[:, :, 0, 1:].mean().item()
+        patches_to_cls = attn_probs[:, :, 1:, 0].mean().item()
+
+    return {
+        "diag_mass": diag_mass,
+        "cls_to_patches": cls_to_patches,
+        "cls_self": cls_self,
+        "patches_to_cls": patches_to_cls,
+        "head_entropy_std": head_entropy_std,
+    }
+
+
+def compute_attention_distance_metrics(
+    attn_probs: torch.Tensor, grid_size: int, radius: int = 1
+) -> dict:
+    """
+    Compute ViT-style attention distance/locality metrics for patch tokens.
+
+    Inspired by "attention distance" diagnostics commonly used with ViTs:
+    expected 2D distance under attention weights.
+    """
+    if attn_probs is None or attn_probs.ndim != 4 or grid_size <= 0:
+        return {
+            "patch_attn_distance_mean": 0.0,
+            "patch_attn_distance_std": 0.0,
+            "patch_local_mass_r1": 0.0,
+        }
+
+    B, H, N, _ = attn_probs.shape
+    has_cls = N == grid_size * grid_size + 1
+    start = 1 if has_cls else 0
+    num_patches = N - start
+    if num_patches != grid_size * grid_size:
+        # Can't infer spatial layout reliably
+        return {
+            "patch_attn_distance_mean": 0.0,
+            "patch_attn_distance_std": 0.0,
+            "patch_local_mass_r1": 0.0,
+        }
+
+    # Patch coords in (row, col)
+    device = attn_probs.device
+    coords = torch.stack(
+        torch.meshgrid(
+            torch.arange(grid_size, device=device),
+            torch.arange(grid_size, device=device),
+            indexing="ij",
+        ),
+        dim=-1,
+    ).reshape(-1, 2)
+    dist = torch.cdist(coords.float(), coords.float(), p=2)  # (P,P)
+
+    a = attn_probs[:, :, start:, start:]  # (B,H,P,P)
+    a = a / (a.sum(dim=-1, keepdim=True) + 1e-8)
+
+    # Expected distance for each head (average over batch + query positions)
+    # E_d = mean_{b,h,i} sum_j a[b,h,i,j] * dist[i,j]
+    exp_d = (a * dist.view(1, 1, num_patches, num_patches)).sum(dim=-1).mean(dim=-1)
+    # exp_d: (B,H) mean over queries; now average over batch -> (H,)
+    per_head = exp_d.mean(dim=0)  # (H,)
+
+    mean = per_head.mean().item()
+    std = per_head.std().item() if H > 1 else 0.0
+
+    # Locality mass: fraction of attention within radius (in patch grid distance)
+    mask = (dist <= float(radius)).float()  # (P,P)
+    local_mass_bh = (a * mask.view(1, 1, num_patches, num_patches)).sum(dim=-1).mean(dim=-1)  # (B,H)
+    local_mass_per_head = local_mass_bh.mean(dim=0)  # (H,)
+    local_mass = local_mass_per_head.mean().item()  # avg over heads
+
+    return {
+        "patch_attn_distance_mean": mean,
+        "patch_attn_distance_std": std,
+        "patch_local_mass_r1": local_mass,
+        "patch_attn_distance_per_head": per_head.detach().cpu().tolist(),
+        "patch_local_mass_r1_per_head": local_mass_per_head.detach().cpu().tolist(),
+    }
+
+
+@torch.no_grad()
+def compute_encoder_block_opt_stats(
+    model: nn.Module,
+    lr: Optional[float] = None,
+    epsilon: float = 1e-12,
+) -> dict:
+    """
+    Compute encoder block-level parameter/gradient norms and ratios.
+
+    Returns lists aligned with `model.encoder.blocks` index:
+      - param_norm
+      - grad_norm
+      - grad_to_param
+      - lr_scaled_grad_to_param (if lr is provided)
+      - nonfinite_grad_params (count of params with non-finite grads)
+    """
+    encoder = getattr(model, "encoder", None)
+    blocks = getattr(encoder, "blocks", None) if encoder is not None else None
+    if blocks is None:
+        return {}
+
+    param_norms: list[float] = []
+    grad_norms: list[float] = []
+    grad_to_param: list[float] = []
+    lr_scaled: list[float] = []
+    nonfinite_params: list[float] = []
+
+    for blk in blocks:
+        p_sq = 0.0
+        g_sq = 0.0
+        nf = 0.0
+        for p in blk.parameters():
+            if not p.requires_grad:
+                continue
+            pf = p.detach().float()
+            p_sq += float(pf.pow(2).sum().item())
+            if p.grad is not None:
+                gf = p.grad.detach().float()
+                g_sq += float(gf.pow(2).sum().item())
+                if not torch.isfinite(gf).all().item():
+                    nf += 1.0
+
+        pn = float((p_sq + float(epsilon)) ** 0.5)
+        gn = float((g_sq + float(epsilon)) ** 0.5)
+        r = gn / (pn + float(epsilon))
+
+        param_norms.append(pn)
+        grad_norms.append(gn)
+        grad_to_param.append(float(r))
+        nonfinite_params.append(float(nf))
+        if lr is not None:
+            lr_scaled.append(float(lr) * float(r))
+
+    out = {
+        "param_norm": param_norms,
+        "grad_norm": grad_norms,
+        "grad_to_param": grad_to_param,
+        "nonfinite_grad_params": nonfinite_params,
+    }
+    if lr is not None:
+        out["lr_scaled_grad_to_param"] = lr_scaled
+    return out
+
+
+@torch.no_grad()
+def estimate_intrinsic_dim_twonn(embeddings: torch.Tensor, epsilon: float = 1e-12) -> float:
+    """
+    TwoNN intrinsic dimension estimator (Facco et al., 2017).
+
+    Works best with a few hundred+ samples; use as a trend metric.
+    """
+    z = embeddings.detach().float()
+    if z.ndim != 2 or z.shape[0] < 10:
+        return 0.0
+
+    # Normalize to reduce scale sensitivity
+    z = z - z.mean(dim=0, keepdim=True)
+    z = z / (z.norm(dim=1, keepdim=True) + 1e-8)
+
+    # Pairwise distances
+    d = torch.cdist(z, z, p=2)  # (N,N)
+    n = d.shape[0]
+    d[torch.arange(n), torch.arange(n)] = float("inf")
+
+    # First and second nearest neighbor distances
+    d1, _ = d.min(dim=1)
+    d2, _ = d.masked_fill(d == d1.unsqueeze(1), float("inf")).min(dim=1)
+
+    mu = (d2 / (d1 + epsilon)).clamp(min=1.0 + 1e-6)
+    mu, _ = torch.sort(mu)
+
+    # Empirical CDF and linear fit through origin:
+    # y = -log(1 - F), x = log(mu), slope ~= intrinsic dimension
+    i = torch.arange(1, n + 1, device=mu.device, dtype=torch.float32)
+    F = (i - 0.5) / n
+    x = torch.log(mu)
+    y = -torch.log(1.0 - F + 1e-6)
+
+    # Least squares slope through origin
+    denom = (x * x).sum().clamp(min=epsilon)
+    slope = (x * y).sum() / denom
+    return slope.item()
+
+
 # =============================================================================
 # Representation Quality Metrics
 # =============================================================================
@@ -450,6 +668,7 @@ def compute_representation_stats(embeddings: torch.Tensor) -> dict:
     centered = embeddings - embeddings.mean(dim=0, keepdim=True)
     cov = centered.T @ centered / B  # (D, D)
 
+    eigenvalues = None
     try:
         eigenvalues = torch.linalg.eigvalsh(cov)
         eigenvalues = eigenvalues.clamp(min=1e-8)
@@ -462,10 +681,9 @@ def compute_representation_stats(embeddings: torch.Tensor) -> dict:
 
     # 4. Isotropy (how uniformly embeddings use all dimensions)
     # Perfect isotropy = eigenvalues are equal
+    isotropy = 0.0
     if eigenvalues is not None:
         isotropy = eigenvalues.min().item() / (eigenvalues.max().item() + 1e-8)
-    else:
-        isotropy = 0.0
 
     return {
         "norm_mean": norm_mean,
@@ -475,6 +693,131 @@ def compute_representation_stats(embeddings: torch.Tensor) -> dict:
         "isotropy": isotropy,
     }
 
+
+def compute_alignment_metrics(
+    z1: torch.Tensor, z2: torch.Tensor, epsilon: float = 1e-8
+) -> dict:
+    """
+    Compute simple alignment metrics between two paired views.
+
+    These are commonly used in self-supervised learning to monitor whether
+    positive pairs stay close (alignment) without collapsing.
+
+    Args:
+        z1: (B, D)
+        z2: (B, D)
+
+    Returns:
+        dict with cosine similarity and normalized L2 distance
+    """
+    z1 = z1.float()
+    z2 = z2.float()
+    z1n = z1 / (z1.norm(dim=1, keepdim=True) + epsilon)
+    z2n = z2 / (z2.norm(dim=1, keepdim=True) + epsilon)
+
+    cos = (z1n * z2n).sum(dim=1).mean().item()
+    l2 = (z1n - z2n).pow(2).sum(dim=1).mean().item()
+    return {"cos": cos, "l2": l2}
+
+
+def compute_covariance_metrics(embeddings: torch.Tensor, epsilon: float = 1e-8) -> dict:
+    """
+    Compute covariance-based redundancy metrics of representations.
+
+    Off-diagonal energy is a standard proxy for feature redundancy
+    (used by redundancy-reduction methods like Barlow Twins).
+    """
+    x = embeddings.float()
+    B, D = x.shape
+    x = x - x.mean(dim=0, keepdim=True)
+    cov = (x.T @ x) / max(B - 1, 1)  # (D, D)
+
+    diag = torch.diagonal(cov)
+    offdiag = cov - torch.diag(diag)
+
+    offdiag_l2 = offdiag.pow(2).mean().item()
+    diag_mean = diag.mean().item()
+    diag_min = diag.min().item()
+
+    var = x.var(dim=0, unbiased=False)
+    var_mean = var.mean().item()
+    var_min = var.min().item()
+
+    return {
+        "cov_offdiag_l2": offdiag_l2,
+        "cov_diag_mean": diag_mean,
+        "cov_diag_min": diag_min,
+        "var_mean": var_mean,
+        "var_min": var_min,
+    }
+
+
+@torch.no_grad()
+def compute_global_norms(model: nn.Module, epsilon: float = 1e-12) -> dict:
+    """
+    Compute global L2 norms for parameters and gradients.
+
+    Useful for dashboards:
+      - opt/param_norm
+      - opt/grad_norm
+      - opt/grad_to_param (scale proxy)
+    """
+    param_sq = 0.0
+    grad_sq = 0.0
+    for p in model.parameters():
+        if not p.requires_grad:
+            continue
+        param_sq += p.detach().float().pow(2).sum().item()
+        if p.grad is not None:
+            grad_sq += p.grad.detach().float().pow(2).sum().item()
+
+    param_norm = (param_sq + epsilon) ** 0.5
+    grad_norm = (grad_sq + epsilon) ** 0.5
+    return {
+        "param_norm": param_norm,
+        "grad_norm": grad_norm,
+        "grad_to_param": grad_norm / param_norm,
+    }
+
+
+@torch.no_grad()
+def compute_linear_cka(x: torch.Tensor, y: torch.Tensor, epsilon: float = 1e-12) -> float:
+    """
+    Compute linear CKA between two feature matrices.
+
+    This is a lightweight representation drift metric that is scale-invariant
+    and correlates well with similarity in learned representations.
+
+    Args:
+        x: (B, D)
+        y: (B, D)
+    """
+    x = x.detach().float()
+    y = y.detach().float()
+
+    if x.ndim != 2 or y.ndim != 2 or x.numel() == 0 or y.numel() == 0:
+        return 0.0
+
+    b = min(x.shape[0], y.shape[0])
+    if b < 2:
+        return 0.0
+
+    x = x[:b]
+    y = y[:b]
+
+    x = x - x.mean(dim=0, keepdim=True)
+    y = y - y.mean(dim=0, keepdim=True)
+
+    xty = x.T @ y
+    xtx = x.T @ x
+    yty = y.T @ y
+
+    hsic = (xty * xty).sum()
+    norm_x = (xtx * xtx).sum().sqrt()
+    norm_y = (yty * yty).sum().sqrt()
+
+    denom = (norm_x * norm_y).clamp(min=epsilon)
+    return (hsic / denom).item()
 
 def compute_feature_collapse_metrics(embeddings: torch.Tensor) -> dict:
     """

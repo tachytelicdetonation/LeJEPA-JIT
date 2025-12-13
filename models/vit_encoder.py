@@ -63,7 +63,10 @@ class Attention(nn.Module):
     ):
         super().__init__()
         self.output_attention = False
+        self.output_attn_logits = False
         self.attn_map = None
+        self.attn_logits = None
+        self.head_mask = None
 
         self.num_heads = num_heads
         self.head_dim = dim // num_heads
@@ -81,15 +84,26 @@ class Attention(nn.Module):
         qkv = qkv.permute(2, 0, 3, 1, 4)  # (3, B, heads, N, head_dim)
         q, k, v = qkv.unbind(0)
 
-        attn = (q @ k.transpose(-2, -1)) * self.scale
-        attn = attn.softmax(dim=-1)
+        attn_logits = (q @ k.transpose(-2, -1)) * self.scale
+        if getattr(self, "output_attn_logits", False):
+            self.attn_logits = attn_logits.detach()
+
+        attn = attn_logits.softmax(dim=-1)
 
         if getattr(self, "output_attention", False):
             self.attn_map = attn.detach()
 
         attn = self.attn_drop(attn)
 
-        x = (attn @ v).transpose(1, 2).reshape(B, N, C)
+        x_heads = attn @ v  # (B, H, N, head_dim)
+        head_mask = getattr(self, "head_mask", None)
+        if head_mask is not None:
+            m = head_mask.to(device=x_heads.device, dtype=x_heads.dtype)
+            if m.ndim == 1:
+                m = m.view(1, -1, 1, 1)
+            x_heads = x_heads * m
+
+        x = x_heads.transpose(1, 2).reshape(B, N, C)
         x = self.proj(x)
         x = self.proj_drop(x)
 

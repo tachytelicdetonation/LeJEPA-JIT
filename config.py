@@ -111,6 +111,16 @@ class Config:
     landscape_radius: float = 0.05
     landscape_points: int = 11
 
+    # Additional heavy diagnostics (epoch-level; can be slow)
+    attn_distance_headmap_interval: int = 1
+    attn_logits_interval: int = 5
+    mlp_output_stats_interval: int = 5
+    head_ablation_interval: int = 10
+    head_ablation_layers: int = 1  # number of last layers to ablate
+    landscape2d_interval: int = 10
+    landscape2d_radius: float = 0.05
+    landscape2d_points: int = 11
+
     # Seed
     seed: int = 42
 

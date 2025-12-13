@@ -30,6 +30,8 @@ import matplotlib
 
 matplotlib.use("Agg")  # Non-interactive backend for server use
 
+from utils.metrics import compute_attention_distance_metrics
+
 
 def _fig_to_pil(fig) -> Image.Image:
     """
@@ -46,6 +48,237 @@ def _fig_to_pil(fig) -> Image.Image:
     # Fallback for older Matplotlib
     return Image.frombytes("RGB", fig.canvas.get_width_height(), fig.canvas.tostring_rgb())
 
+
+@torch.no_grad()
+def generate_embedding_spectrum(
+    embeddings: torch.Tensor, title: str = "Embedding Covariance Spectrum"
+) -> Image.Image:
+    """
+    Plot the eigenvalue spectrum of the embedding covariance matrix.
+
+    Useful for spotting rank collapse (spectrum concentrates) and anisotropy.
+    """
+    z = embeddings.detach().float()
+    if z.ndim != 2 or z.numel() == 0:
+        fig, ax = plt.subplots(figsize=(6, 3))
+        ax.set_title(title)
+        ax.text(0.5, 0.5, "No embeddings", ha="center", va="center")
+        ax.axis("off")
+        pil = _fig_to_pil(fig)
+        plt.close(fig)
+        return pil
+
+    z = z - z.mean(dim=0, keepdim=True)
+    B = z.shape[0]
+    cov = (z.T @ z) / max(B - 1, 1)
+    try:
+        eig = torch.linalg.eigvalsh(cov).clamp(min=1e-12)
+        eig = torch.sort(eig, descending=True).values.cpu().numpy()
+    except Exception:
+        eig = None
+
+    fig, ax = plt.subplots(figsize=(7, 3.5))
+    ax.set_title(title)
+    if eig is None:
+        ax.text(0.5, 0.5, "Spectrum failed", ha="center", va="center")
+        ax.axis("off")
+    else:
+        ax.plot(eig, linewidth=2)
+        ax.set_yscale("log")
+        ax.set_xlabel("Eigenvalue index (sorted)")
+        ax.set_ylabel("Eigenvalue (log scale)")
+        ax.grid(True, alpha=0.3)
+
+    pil = _fig_to_pil(fig)
+    plt.close(fig)
+    return pil
+
+
+def generate_layerwise_curves(
+    curves: Dict[str, List[float]],
+    title: str,
+    xlabel: str = "Layer",
+    ylabel: str = "Value",
+) -> Image.Image:
+    """Plot one or more layer-wise curves and return as PIL."""
+    fig, ax = plt.subplots(figsize=(7.5, 3.5))
+    ax.set_title(title)
+
+    if not curves:
+        ax.text(0.5, 0.5, "No curves", ha="center", va="center")
+        ax.axis("off")
+        pil = _fig_to_pil(fig)
+        plt.close(fig)
+        return pil
+
+    for name, vals in curves.items():
+        if not vals:
+            continue
+        ax.plot(list(range(len(vals))), vals, marker="o", linewidth=2, label=name)
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    ax.legend(loc="best", fontsize=8)
+
+    pil = _fig_to_pil(fig)
+    plt.close(fig)
+    return pil
+
+
+def generate_loss_landscape_slice(
+    alphas: List[float],
+    losses: List[float],
+    title: str,
+    xlabel: str = "alpha",
+    ylabel: str = "loss",
+) -> Image.Image:
+    fig, ax = plt.subplots(figsize=(7.5, 3.5))
+    ax.set_title(title)
+    if not alphas or not losses or len(alphas) != len(losses):
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        ax.axis("off")
+        pil = _fig_to_pil(fig)
+        plt.close(fig)
+        return pil
+
+    ax.plot(alphas, losses, marker="o", linewidth=2)
+    ax.axvline(0.0, color="black", linewidth=1, alpha=0.4)
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    pil = _fig_to_pil(fig)
+    plt.close(fig)
+    return pil
+
+
+def generate_loss_landscape_2d(
+    alphas: List[float],
+    betas: List[float],
+    losses_grid: List[List[float]],
+    title: str,
+    xlabel: str = "alpha",
+    ylabel: str = "beta",
+) -> Image.Image:
+    fig, ax = plt.subplots(figsize=(6.5, 5.5))
+    ax.set_title(title)
+    if not alphas or not betas or not losses_grid:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        ax.axis("off")
+        pil = _fig_to_pil(fig)
+        plt.close(fig)
+        return pil
+
+    grid = np.asarray(losses_grid, dtype=np.float32)
+    extent = [min(alphas), max(alphas), min(betas), max(betas)]
+    im = ax.imshow(
+        grid,
+        origin="lower",
+        aspect="auto",
+        extent=extent,
+        cmap="viridis",
+    )
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    pil = _fig_to_pil(fig)
+    plt.close(fig)
+    return pil
+
+
+@torch.no_grad()
+def generate_attention_distance_per_head_heatmap(
+    model,
+    images: torch.Tensor,
+    device: torch.device,
+    grid_size: int,
+    radius: int = 1,
+    figsize: Tuple[int, int] = (10, 4),
+) -> Image.Image:
+    """
+    Head×layer heatmaps for attention distance/locality.
+
+    Produces two heatmaps:
+      - expected attention distance per head
+      - local attention mass within `radius` per head
+    """
+    model.eval()
+
+    for block in model.encoder.blocks:
+        block.attn.output_attention = True
+
+    images = images.to(device)
+    _ = model.encoder(images)
+    attentions = model.encoder.get_attention_maps()
+
+    for block in model.encoder.blocks:
+        block.attn.output_attention = False
+
+    if not attentions:
+        return Image.new("RGB", (400, 300))
+
+    num_layers = len(attentions)
+    num_heads = attentions[0].shape[1]
+
+    dist_map = np.zeros((num_layers, num_heads), dtype=np.float32)
+    local_map = np.zeros((num_layers, num_heads), dtype=np.float32)
+
+    for li, attn in enumerate(attentions):
+        m = compute_attention_distance_metrics(attn, grid_size=grid_size, radius=radius)
+        d = m.get("patch_attn_distance_per_head", [0.0] * num_heads)
+        l = m.get("patch_local_mass_r1_per_head", [0.0] * num_heads)
+        if len(d) == num_heads:
+            dist_map[li, :] = np.asarray(d, dtype=np.float32)
+        if len(l) == num_heads:
+            local_map[li, :] = np.asarray(l, dtype=np.float32)
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    for ax, data, title, cmap in [
+        (axes[0], dist_map, "Patch Attn Distance (per head)", "viridis"),
+        (axes[1], local_map, f"Local Mass r≤{radius} (per head)", "magma"),
+    ]:
+        im = ax.imshow(data, aspect="auto", cmap=cmap, origin="lower")
+        ax.set_xlabel("Head")
+        ax.set_ylabel("Layer")
+        ax.set_title(title)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    img = _fig_to_pil(fig)
+    plt.close(fig)
+    return img
+
+
+def generate_head_ablation_heatmap(
+    delta_losses: List[List[float]],
+    title: str,
+    figsize: Tuple[int, int] = (8, 4),
+) -> Image.Image:
+    """
+    Heatmap of Δloss when ablating heads.
+
+    delta_losses: shape (L, H) where entry is loss_ablate - loss_base.
+    """
+    fig, ax = plt.subplots(figsize=figsize)
+    ax.set_title(title)
+    if not delta_losses:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        ax.axis("off")
+        pil = _fig_to_pil(fig)
+        plt.close(fig)
+        return pil
+
+    data = np.asarray(delta_losses, dtype=np.float32)
+    im = ax.imshow(data, aspect="auto", cmap="coolwarm", origin="lower")
+    ax.set_xlabel("Head")
+    ax.set_ylabel("Layer")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    pil = _fig_to_pil(fig)
+    plt.close(fig)
+    return pil
 
 @torch.no_grad()
 def compute_pca_projection(embeddings: torch.Tensor) -> torch.Tensor:
@@ -91,6 +324,8 @@ def generate_pca_visualization(
     device: torch.device,
     img_size: int = 128,
     patch_size: int = 8,
+    pca_resample: str = "nearest",
+    per_image_pca: bool = False,
 ) -> Image.Image:
     """
     Generate a grid of Original vs PCA visualizations.
@@ -132,14 +367,25 @@ def generate_pca_visualization(
     B, N, D = feats.shape
     h = w = int(N**0.5)
 
-    # Flatten all patches from all images to compute a global PCA
-    flat_feats = feats.reshape(-1, D)  # (B*N, D)
+    if per_image_pca:
+        pca_maps = []
+        for i in range(B):
+            p = compute_pca_projection(feats[i])  # (N, 3)
+            pca_maps.append(p.reshape(h, w, 3))
+        pca_maps = torch.stack(pca_maps, dim=0)  # (B, h, w, 3)
+    else:
+        # Flatten all patches from all images to compute a global PCA
+        flat_feats = feats.reshape(-1, D)  # (B*N, D)
 
-    # Compute PCA
-    pca_feats = compute_pca_projection(flat_feats)  # (B*N, 3)
+        # Compute PCA
+        pca_feats = compute_pca_projection(flat_feats)  # (B*N, 3)
 
-    # Reshape back to (B, h, w, 3)
-    pca_maps = pca_feats.reshape(B, h, w, 3)
+        # Reshape back to (B, h, w, 3)
+        pca_maps = pca_feats.reshape(B, h, w, 3)
+
+    resample = Image.NEAREST
+    if pca_resample.lower() in {"bilinear", "linear"}:
+        resample = Image.BILINEAR
 
     vis_imgs = []
 
@@ -148,14 +394,12 @@ def generate_pca_visualization(
         img = images[i].detach().cpu()  # (3, H, W)
         # Min-max scale to 0-1
         img = (img - img.min()) / (img.max() - img.min())
-        img = TF.to_pil_image(img).resize((img_size, img_size))
+        img = TF.to_pil_image(img).resize((img_size, img_size), resample=Image.BILINEAR)
 
         # 2. PCA Map
         pca = pca_maps[i].detach().cpu().numpy()  # (h, w, 3)
         pca = (pca * 255).astype(np.uint8)
-        pca_img = Image.fromarray(pca).resize(
-            (img_size, img_size), resample=Image.NEAREST
-        )
+        pca_img = Image.fromarray(pca).resize((img_size, img_size), resample=resample)
 
         # Combine vertical
         combined = Image.new("RGB", (img_size, img_size * 2))

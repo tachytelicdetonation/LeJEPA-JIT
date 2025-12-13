@@ -49,6 +49,7 @@ from utils.metrics import (
     compute_linear_cka,
     compute_attention_structure_metrics,
     compute_attention_distance_metrics,
+    compute_encoder_block_opt_stats,
     estimate_intrinsic_dim_twonn,
 )
 
@@ -258,7 +259,24 @@ def train_one_epoch(
                             head_ent.std(dim=1).mean().item()
                         )
 
+        nonfinite_loss = float((~torch.isfinite(loss.detach())).item())
+
         # Backward pass
+        if nonfinite_loss > 0.0:
+            optimizer.zero_grad(set_to_none=True)
+            if config.use_wandb:
+                try:
+                    import wandb
+
+                    global_step = (epoch - 1) * len(train_loader) + batch_idx
+                    wandb.log(
+                        {"step": global_step, "sys/nonfinite_loss": nonfinite_loss},
+                        commit=True,
+                    )
+                except Exception:
+                    pass
+            raise RuntimeError("Non-finite loss encountered during training.")
+
         optimizer.zero_grad()
         scaler.scale(loss).backward()
 
@@ -266,12 +284,31 @@ def train_one_epoch(
         # (On non-logging steps, GradScaler will unscale inside scaler.step()).
         opt_norms_model = None
         opt_norms_probe = None
+        block_opt_metrics = {}
         if batch_idx % config.log_interval == 0 and scaler.is_enabled():
             scaler.unscale_(optimizer)
 
         if batch_idx % config.log_interval == 0:
             opt_norms_model = compute_global_norms(model)
             opt_norms_probe = compute_global_norms(probe)
+            lr_cur = float(optimizer.param_groups[0].get("lr", 0.0))
+            blk = compute_encoder_block_opt_stats(model, lr=lr_cur)
+            if blk:
+                depth = len(blk.get("param_norm", []))
+                for li in range(depth):
+                    block_opt_metrics[f"opt_block/param_norm/l{li}"] = blk["param_norm"][li]
+                    block_opt_metrics[f"opt_block/grad_norm/l{li}"] = blk["grad_norm"][li]
+                    block_opt_metrics[f"opt_block/grad_to_param/l{li}"] = blk["grad_to_param"][li]
+                    if "lr_scaled_grad_to_param" in blk:
+                        block_opt_metrics[
+                            f"opt_block/lr_scaled_grad_to_param/l{li}"
+                        ] = blk["lr_scaled_grad_to_param"][li]
+                    block_opt_metrics[
+                        f"opt_block/nonfinite_grad_params/l{li}"
+                    ] = blk["nonfinite_grad_params"][li]
+                block_opt_metrics["sys/nonfinite_grad_params"] = float(
+                    sum(blk.get("nonfinite_grad_params", []))
+                )
 
         scaler.step(optimizer)
         scaler.update()
@@ -451,6 +488,8 @@ def train_one_epoch(
                             else 0.0
                         ),
                         **sys_metrics,
+                        "sys/nonfinite_loss": nonfinite_loss,
+                        **block_opt_metrics,
                     }
                 )
         else:
@@ -890,6 +929,148 @@ def _loss_landscape_slice(
 
     return {"alphas": alphas, "losses_grad": losses_grad, "losses_rand": losses_rand}
 
+def _loss_landscape_2d(
+    model: nn.Module,
+    probe: LinearProbe,
+    loss_fn: LeJEPALoss,
+    crops: list[torch.Tensor],
+    labels: torch.Tensor,
+    device: torch.device,
+    mixed_precision: bool,
+    radius: float,
+    points: int,
+) -> dict:
+    """
+    Evaluate loss on a 2D grid in parameter space:
+      - direction 1: gradient direction (on subset), or random if gradient is zero
+      - direction 2: random direction orthogonalized against direction 1
+    """
+    named = _select_diag_params(model)
+    params = [p for _n, p in named]
+    if not params:
+        return {"alphas": [], "betas": [], "loss_grid": []}
+
+    model.zero_grad(set_to_none=True)
+    probe.zero_grad(set_to_none=True)
+
+    base_loss, _aux = _compute_training_loss_from_crops(
+        model, probe, loss_fn, crops, labels, device, mixed_precision
+    )
+    grads = torch.autograd.grad(base_loss, params, retain_graph=False, allow_unused=True)
+
+    d1 = [torch.zeros_like(p) if g is None else g.detach().float() for p, g in zip(params, grads)]
+
+    def _dot(a: list[torch.Tensor], b: list[torch.Tensor]) -> torch.Tensor:
+        s = 0.0
+        for x, y in zip(a, b):
+            s = s + (x.float() * y.float()).sum()
+        return s
+
+    def _norm(vs: list[torch.Tensor]) -> torch.Tensor:
+        return torch.sqrt(sum([v.float().pow(2).sum() for v in vs]) + 1e-12)
+
+    n1 = _norm(d1).item()
+    if n1 <= 0:
+        d1 = [torch.randn_like(p, dtype=torch.float32) for p in params]
+        n1 = _norm(d1).item()
+    d1 = [v / (n1 + 1e-12) for v in d1]
+
+    d2 = [torch.randn_like(p, dtype=torch.float32) for p in params]
+    proj = _dot(d2, d1)
+    d2 = [v - proj * u for v, u in zip(d2, d1)]
+    n2 = _norm(d2).item()
+    if n2 <= 0:
+        d2 = [torch.randn_like(p, dtype=torch.float32) for p in params]
+        n2 = _norm(d2).item()
+    d2 = [v / (n2 + 1e-12) for v in d2]
+
+    pnorm = _norm([p.detach().float() for p in params]).item()
+    scale = float(radius) * float(pnorm)
+
+    alphas = torch.linspace(-1.0, 1.0, steps=max(3, points)).tolist()
+    betas = torch.linspace(-1.0, 1.0, steps=max(3, points)).tolist()
+
+    originals = [p.detach().clone() for p in params]
+
+    def _set(alpha: float, beta: float):
+        for p, p0, u, v in zip(params, originals, d1, d2):
+            delta = (alpha * scale) * u + (beta * scale) * v
+            p.copy_(p0 + delta.to(p.device, dtype=p.dtype))
+
+    grid: list[list[float]] = []
+    with torch.no_grad():
+        for b in betas:
+            row: list[float] = []
+            for a in alphas:
+                _set(float(a), float(b))
+                l, _ = _compute_training_loss_from_crops(
+                    model, probe, loss_fn, crops, labels, device, mixed_precision
+                )
+                row.append(float(l.detach().item()))
+            grid.append(row)
+
+    for p, p0 in zip(params, originals):
+        p.copy_(p0)
+
+    return {"alphas": alphas, "betas": betas, "loss_grid": grid}
+
+
+@torch.no_grad()
+def _head_ablation_sensitivity(
+    model: nn.Module,
+    probe: LinearProbe,
+    loss_fn: LeJEPALoss,
+    crops: list[torch.Tensor],
+    labels: torch.Tensor,
+    device: torch.device,
+    mixed_precision: bool,
+    last_layers: int,
+) -> dict:
+    """
+    Compute Δloss when ablating individual attention heads.
+
+    Returns a (L,H) matrix over the last `last_layers` encoder blocks.
+    """
+    if last_layers <= 0:
+        return {"base_loss": 0.0, "layers": [], "delta_loss": []}
+
+    base_loss, _ = _compute_training_loss_from_crops(
+        model, probe, loss_fn, crops, labels, device, mixed_precision
+    )
+    base = float(base_loss.detach().item())
+
+    blocks = list(getattr(model.encoder, "blocks", []))
+    if not blocks:
+        return {"base_loss": base, "layers": [], "delta_loss": []}
+
+    num_layers = len(blocks)
+    start = max(0, num_layers - last_layers)
+    layer_ids = list(range(start, num_layers))
+
+    # infer num_heads from the block's attention module
+    num_heads = int(getattr(blocks[-1].attn, "num_heads", 0))
+    if num_heads <= 0:
+        return {"base_loss": base, "layers": layer_ids, "delta_loss": []}
+
+    delta: list[list[float]] = []
+
+    for li in layer_ids:
+        attn = blocks[li].attn
+        orig_mask = getattr(attn, "head_mask", None)
+        row: list[float] = []
+        for hi in range(num_heads):
+            m = torch.ones(num_heads, device=device, dtype=torch.float32)
+            m[hi] = 0.0
+            attn.head_mask = m
+            l, _ = _compute_training_loss_from_crops(
+                model, probe, loss_fn, crops, labels, device, mixed_precision
+            )
+            row.append(float(l.detach().item()) - base)
+        attn.head_mask = orig_mask
+        delta.append(row)
+
+    return {"base_loss": base, "layers": layer_ids, "delta_loss": delta}
+
 def count_parameters(model: nn.Module) -> int:
     """Count trainable parameters."""
     return sum(p.numel() for p in model.parameters() if p.requires_grad)
@@ -915,6 +1096,14 @@ def main():
     parser.add_argument("--use_wandb", action="store_true", default=None)
     parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default=None)
+    parser.add_argument("--attn_distance_headmap_interval", type=int, default=None)
+    parser.add_argument("--attn_logits_interval", type=int, default=None)
+    parser.add_argument("--mlp_output_stats_interval", type=int, default=None)
+    parser.add_argument("--head_ablation_interval", type=int, default=None)
+    parser.add_argument("--head_ablation_layers", type=int, default=None)
+    parser.add_argument("--landscape2d_interval", type=int, default=None)
+    parser.add_argument("--landscape2d_radius", type=float, default=None)
+    parser.add_argument("--landscape2d_points", type=int, default=None)
     args = parser.parse_args()
 
     # Create config with overrides
@@ -961,6 +1150,7 @@ def main():
             wandb.define_metric("epoch")
             wandb.define_metric("train/*", step_metric="step")
             wandb.define_metric("opt/*", step_metric="step")
+            wandb.define_metric("opt_block/*", step_metric="step")
             wandb.define_metric("rep/*", step_metric="step")
             wandb.define_metric("sys/*", step_metric="step")
             wandb.define_metric("attn/*", step_metric="step")
@@ -969,6 +1159,8 @@ def main():
             wandb.define_metric("val_*", step_metric="epoch")
             wandb.define_metric("attention/*", step_metric="epoch")
             wandb.define_metric("collapse/*", step_metric="epoch")
+            wandb.define_metric("epoch_attn_logit/*", step_metric="epoch")
+            wandb.define_metric("epoch_mlp/*", step_metric="epoch")
             wandb.define_metric("epoch_rep/*", step_metric="epoch")
             wandb.define_metric("knn/*", step_metric="epoch")
             wandb.define_metric("lid/*", step_metric="epoch")
@@ -1108,6 +1300,7 @@ def main():
         generate_layer_attention_evolution,
         generate_per_head_attention,
         generate_head_importance_heatmap,
+        generate_attention_distance_per_head_heatmap,
         generate_token_similarity_heatmap,
         generate_rsm_across_layers,
         generate_gradient_flow_heatmap,
@@ -1116,6 +1309,8 @@ def main():
         generate_embedding_spectrum,
         generate_layerwise_curves,
         generate_loss_landscape_slice,
+        generate_loss_landscape_2d,
+        generate_head_ablation_heatmap,
         generate_training_dashboard,
         AttentionTracker,
     )
@@ -1890,6 +2085,134 @@ def main():
                                     commit=False,
                                 )
 
+                        # Head×layer attention distance/locality heatmap
+                        if (
+                            config.use_wandb
+                            and epoch % config.attn_distance_headmap_interval == 0
+                        ):
+                            dist_head = generate_attention_distance_per_head_heatmap(
+                                model,
+                                vis_images,
+                                device,
+                                grid_size=config.img_size // config.patch_size,
+                                radius=1,
+                            )
+                            wandb.log(
+                                {
+                                    "epoch_attn_layer/attn_distance_per_head": wandb.Image(
+                                        dist_head, caption=f"Epoch {epoch}"
+                                    )
+                                },
+                                commit=False,
+                            )
+
+                # 12b. Attention logit stats (pre-softmax QK^T) per layer
+                if config.use_wandb and epoch % config.attn_logits_interval == 0:
+                    import wandb
+
+                    for blk in model.encoder.blocks:
+                        blk.attn.output_attn_logits = True
+
+                    _ = model.encoder(vis_images)
+
+                    logit_metrics = {}
+                    means = []
+                    p99s = []
+                    maxs = []
+                    for li, blk in enumerate(model.encoder.blocks):
+                        logits = getattr(blk.attn, "attn_logits", None)
+                        if logits is None:
+                            means.append(0.0)
+                            p99s.append(0.0)
+                            maxs.append(0.0)
+                            continue
+                        t = logits.detach().float()
+                        means.append(float(t.mean().item()))
+                        maxs.append(float(t.max().item()))
+                        try:
+                            p99s.append(float(torch.quantile(t.reshape(-1), 0.99).item()))
+                        except Exception:
+                            p99s.append(float(t.flatten().kthvalue(max(1, int(0.99 * t.numel()))).values.item()))
+
+                        logit_metrics[f"epoch_attn_logit/mean/l{li}"] = means[-1]
+                        logit_metrics[f"epoch_attn_logit/p99/l{li}"] = p99s[-1]
+                        logit_metrics[f"epoch_attn_logit/max/l{li}"] = maxs[-1]
+
+                    for blk in model.encoder.blocks:
+                        blk.attn.output_attn_logits = False
+                        blk.attn.attn_logits = None
+
+                    wandb.log(logit_metrics, commit=False)
+                    logit_plot = generate_layerwise_curves(
+                        {"mean": means, "p99": p99s, "max": maxs},
+                        title=f"Attention Logits (pre-softmax) (Epoch {epoch})",
+                        ylabel="value",
+                    )
+                    wandb.log(
+                        {
+                            "epoch_attn_logit/curves": wandb.Image(
+                                logit_plot, caption=f"Epoch {epoch}"
+                            )
+                        },
+                        commit=False,
+                    )
+
+                # 12c. MLP output stats per layer (outliers/saturation proxy)
+                if config.use_wandb and epoch % config.mlp_output_stats_interval == 0:
+                    import wandb
+
+                    mlp_metrics = {}
+                    means = []
+                    stds = []
+                    max_abs = []
+                    outlier = []
+
+                    handles = []
+
+                    def _make_mlp_hook(li: int):
+                        def _hook(_mod, _inp, out):
+                            y = out.detach().float()
+                            m = float(y.mean().item())
+                            s = float(y.std().item())
+                            ma = float(y.abs().max().item())
+                            thr = 5.0 * s + 1e-6
+                            o = float((y.abs() > thr).float().mean().item())
+
+                            means.append(m)
+                            stds.append(s)
+                            max_abs.append(ma)
+                            outlier.append(o)
+
+                            mlp_metrics[f"epoch_mlp/out_mean/l{li}"] = m
+                            mlp_metrics[f"epoch_mlp/out_std/l{li}"] = s
+                            mlp_metrics[f"epoch_mlp/out_max_abs/l{li}"] = ma
+                            mlp_metrics[f"epoch_mlp/out_outlier_rate_5std/l{li}"] = o
+
+                        return _hook
+
+                    for li, blk in enumerate(model.encoder.blocks):
+                        handles.append(blk.mlp.register_forward_hook(_make_mlp_hook(li)))
+
+                    _ = model.encoder(vis_images)
+
+                    for h in handles:
+                        h.remove()
+
+                    wandb.log(mlp_metrics, commit=False)
+                    mlp_plot = generate_layerwise_curves(
+                        {"std": stds, "max_abs": max_abs, "outlier_rate_5std": outlier},
+                        title=f"MLP Output Stats (Epoch {epoch})",
+                        ylabel="value",
+                    )
+                    wandb.log(
+                        {
+                            "epoch_mlp/curves": wandb.Image(
+                                mlp_plot, caption=f"Epoch {epoch}"
+                            )
+                        },
+                        commit=False,
+                    )
+
                 # 13. Training Dashboard (every 10 epochs)
                 if epoch % config.training_dashboard_interval == 0 and len(loss_history) > 1:
                     dashboard = generate_training_dashboard(
@@ -2013,6 +2336,76 @@ def main():
                             )
                     except Exception as e:
                         print(f"Loss landscape diagnostics failed: {e}")
+
+                if config.use_wandb and epoch % config.landscape2d_interval == 0:
+                    try:
+                        diag_crops, diag_labels = next(iter(train_loader))
+                        b = min(config.diagnostic_batch_size, diag_labels.shape[0])
+                        diag_crops = [c[:b] for c in diag_crops]
+                        diag_labels = diag_labels[:b]
+                        ls2 = _loss_landscape_2d(
+                            model,
+                            probe,
+                            loss_fn,
+                            diag_crops,
+                            diag_labels,
+                            device,
+                            mixed_precision=config.mixed_precision,
+                            radius=config.landscape2d_radius,
+                            points=config.landscape2d_points,
+                        )
+                        if ls2["alphas"] and ls2["betas"] and ls2["loss_grid"]:
+                            plot2d = generate_loss_landscape_2d(
+                                ls2["alphas"],
+                                ls2["betas"],
+                                ls2["loss_grid"],
+                                title=f"Loss Landscape 2D (grad vs orth rand) Epoch {epoch}",
+                            )
+                            wandb.log(
+                                {
+                                    "epoch_opt/loss_landscape_2d": wandb.Image(
+                                        plot2d, caption=f"Epoch {epoch}"
+                                    )
+                                },
+                                commit=False,
+                            )
+                    except Exception as e:
+                        print(f"2D loss landscape diagnostics failed: {e}")
+
+                if config.use_wandb and epoch % config.head_ablation_interval == 0:
+                    try:
+                        diag_crops, diag_labels = next(iter(train_loader))
+                        b = min(config.diagnostic_batch_size, diag_labels.shape[0])
+                        diag_crops = [c[:b] for c in diag_crops]
+                        diag_labels = diag_labels[:b]
+                        ab = _head_ablation_sensitivity(
+                            model,
+                            probe,
+                            loss_fn,
+                            diag_crops,
+                            diag_labels,
+                            device,
+                            mixed_precision=config.mixed_precision,
+                            last_layers=config.head_ablation_layers,
+                        )
+                        if ab.get("delta_loss"):
+                            base = float(ab.get("base_loss", 0.0))
+                            layers = ab.get("layers", [])
+                            title = (
+                                f"Head Ablation Δloss (last {len(layers)} layers) "
+                                f"(base={base:.4f}) Epoch {epoch}"
+                            )
+                            hm = generate_head_ablation_heatmap(ab["delta_loss"], title=title)
+                            wandb.log(
+                                {
+                                    "epoch_attn/head_ablation_delta_loss": wandb.Image(
+                                        hm, caption=f"Epoch {epoch}"
+                                    )
+                                },
+                                commit=False,
+                            )
+                    except Exception as e:
+                        print(f"Head ablation diagnostics failed: {e}")
 
             except Exception as e:
                 print(f"Error generating visualization: {e}")
