@@ -838,7 +838,8 @@ def _hessian_top_eig_power_iter(
             for g, v in zip(grads, vec):
                 if g is None:
                     continue
-                dot = dot + (g.detach() * v).sum()
+                # NOTE: do NOT detach `g` here; we need its graph for Hessian-vector products.
+                dot = dot + (g * v.to(device=g.device, dtype=g.dtype)).sum()
             hv = torch.autograd.grad(dot, params, retain_graph=True, allow_unused=True)
             hv = [
                 torch.zeros_like(p, dtype=torch.float32)
@@ -942,8 +943,9 @@ def _loss_landscape_slice(
             losses_rand.append(float(l.detach().item()))
 
     # Restore
-    for p, p0 in zip(params, originals):
-        p.copy_(p0)
+    with torch.no_grad():
+        for p, p0 in zip(params, originals):
+            p.copy_(p0)
 
     return {"alphas": alphas, "losses_grad": losses_grad, "losses_rand": losses_rand}
 
@@ -1027,8 +1029,9 @@ def _loss_landscape_2d(
                 row.append(float(l.detach().item()))
             grid.append(row)
 
-    for p, p0 in zip(params, originals):
-        p.copy_(p0)
+    with torch.no_grad():
+        for p, p0 in zip(params, originals):
+            p.copy_(p0)
 
     return {"alphas": alphas, "betas": betas, "loss_grid": grid}
 
