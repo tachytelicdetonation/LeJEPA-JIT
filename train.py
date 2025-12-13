@@ -41,6 +41,15 @@ from utils.metrics import (
     compute_layer_gradient_stats,
     compute_head_diversity,
     compute_feature_collapse_metrics,
+    compute_representation_stats,
+    compute_alignment_metrics,
+    compute_covariance_metrics,
+    compute_global_norms,
+    compute_attention_rank,
+    compute_linear_cka,
+    compute_attention_structure_metrics,
+    compute_attention_distance_metrics,
+    estimate_intrinsic_dim_twonn,
 )
 
 def _amp_dtype_for_device(device: torch.device) -> torch.dtype:
@@ -104,8 +113,11 @@ def train_one_epoch(
     total_grad_norm = 0
 
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+    prev_iter_end = time.perf_counter()
 
     for batch_idx, (crops, labels) in enumerate(pbar):
+        iter_start = time.perf_counter()
+        data_time = iter_start - prev_iter_end
         # crops is a list of [global1, global2, local1, ..., local6]
         # Move all crops to device
         crops = [c.to(device, non_blocking=True) for c in crops]
@@ -176,6 +188,20 @@ def train_one_epoch(
         current_entropy = 0.0
         current_gini = 0.0
         current_sparsity = 0.0
+        attn_rank = {"effective_rank": 0.0, "spectral_norm": 0.0}
+        attn_struct = {
+            "diag_mass": 0.0,
+            "cls_to_patches": 0.0,
+            "cls_self": 0.0,
+            "patches_to_cls": 0.0,
+            "head_entropy_std": 0.0,
+        }
+        attn_dist = {
+            "patch_attn_distance_mean": 0.0,
+            "patch_attn_distance_std": 0.0,
+            "patch_local_mass_r1": 0.0,
+        }
+        attn_layer_metrics = {}
 
         if batch_idx % config.log_interval == 0:
             with torch.no_grad():
@@ -188,15 +214,65 @@ def train_one_epoch(
                 for blk in model.encoder.blocks:
                     blk.attn.output_attention = False
 
-                # Compute metrics on last layer
-                last_attn = attns[-1]
-                current_entropy = compute_entropy(last_attn).item()
-                current_gini = compute_gini(last_attn).item()
-                current_sparsity = compute_sparsity(last_attn).item()
+                if attns:
+                    # Compute metrics on last layer
+                    last_attn = attns[-1]
+                    current_entropy = compute_entropy(last_attn).item()
+                    current_gini = compute_gini(last_attn).item()
+                    current_sparsity = compute_sparsity(last_attn).item()
+                    attn_rank = compute_attention_rank(last_attn)
+                    attn_struct = compute_attention_structure_metrics(last_attn)
+                    attn_dist = compute_attention_distance_metrics(
+                        last_attn, grid_size=config.img_size // config.patch_size, radius=1
+                    )
+
+                    # Per-layer CLS sink / diagonal / head-entropy collapse
+                    eps = 1e-8
+                    for li, a in enumerate(attns):
+                        m = compute_attention_structure_metrics(a)
+                        for k, v in m.items():
+                            attn_layer_metrics[f"attn_layer/{k}/l{li}"] = v
+
+                        d = compute_attention_distance_metrics(
+                            a, grid_size=config.img_size // config.patch_size, radius=1
+                        )
+                        attn_layer_metrics[
+                            f"attn_layer/patch_attn_distance_mean/l{li}"
+                        ] = d.get("patch_attn_distance_mean", 0.0)
+                        attn_layer_metrics[
+                            f"attn_layer/patch_local_mass_r1/l{li}"
+                        ] = d.get("patch_local_mass_r1", 0.0)
+
+                        # Head entropy stats (collapse indicator)
+                        head_ent = -(a * torch.log(a + eps)).sum(dim=-1).mean(dim=-1)  # (B,H)
+                        attn_layer_metrics[f"attn_layer/head_entropy_mean/l{li}"] = (
+                            head_ent.mean().item()
+                        )
+                        attn_layer_metrics[f"attn_layer/head_entropy_min/l{li}"] = (
+                            head_ent.min(dim=1).values.mean().item()
+                        )
+                        attn_layer_metrics[f"attn_layer/head_entropy_max/l{li}"] = (
+                            head_ent.max(dim=1).values.mean().item()
+                        )
+                        attn_layer_metrics[f"attn_layer/head_entropy_std/l{li}"] = (
+                            head_ent.std(dim=1).mean().item()
+                        )
 
         # Backward pass
         optimizer.zero_grad()
         scaler.scale(loss).backward()
+
+        # Unscale grads on logging steps so any gradient-based metrics are comparable.
+        # (On non-logging steps, GradScaler will unscale inside scaler.step()).
+        opt_norms_model = None
+        opt_norms_probe = None
+        if batch_idx % config.log_interval == 0 and scaler.is_enabled():
+            scaler.unscale_(optimizer)
+
+        if batch_idx % config.log_interval == 0:
+            opt_norms_model = compute_global_norms(model)
+            opt_norms_probe = compute_global_norms(probe)
+
         scaler.step(optimizer)
         scaler.update()
         scheduler.step()
@@ -208,6 +284,8 @@ def train_one_epoch(
             # Average norm over layers
             norms = [g.norm().item() for g in attn_grads]
             current_grad_norm = sum(norms) / len(norms)
+            if scaler.is_enabled():
+                current_grad_norm /= float(scaler.get_scale())
             attn_grads.clear()  # Reset for next batch
 
         # Compute accuracy (on first global view only)
@@ -218,6 +296,19 @@ def train_one_epoch(
             correct = (pred == labels).sum().item()
             total_correct += correct
             total_samples += B
+            batch_acc = 100.0 * correct / max(B, 1)
+
+        # Representation health metrics from the already-computed global embeddings
+        rep_stats = {}
+        align_stats = {}
+        cov_stats = {}
+        if batch_idx % config.log_interval == 0:
+            with torch.no_grad():
+                z = emb_global.view(B, 2, -1).float()
+                z_mean = z.mean(dim=1)
+                rep_stats = compute_representation_stats(z_mean)
+                align_stats = compute_alignment_metrics(z[:, 0], z[:, 1])
+                cov_stats = compute_covariance_metrics(z_mean)
 
         # Accumulate losses
         total_loss += lejepa_loss.item()
@@ -232,35 +323,138 @@ def train_one_epoch(
 
         # Update progress bar and log to wandb
         if batch_idx % config.log_interval == 0:
+            lrs = scheduler.get_last_lr()
+            lr_encoder = lrs[0] if lrs else 0.0
+            lr_probe = lrs[1] if len(lrs) > 1 else lr_encoder
             pbar.set_postfix(
                 {
                     "loss": f"{lejepa_loss.item():.4f}",
                     "sigreg": f"{loss_dict['sigreg_loss'].item():.4f}",
                     "inv": f"{loss_dict['invariance_loss'].item():.4f}",
                     "acc": f"{100 * total_correct / total_samples:.1f}%",
-                    "lr": f"{scheduler.get_last_lr()[0]:.2e}",
+                    "lr_e": f"{lr_encoder:.2e}",
+                    "lr_p": f"{lr_probe:.2e}",
                 }
             )
             # Log batch metrics to wandb
+            iter_end = time.perf_counter()
+            batch_time = iter_end - iter_start
+            prev_iter_end = iter_end
+
             if config.use_wandb:
                 import wandb
 
                 global_step = (epoch - 1) * len(train_loader) + batch_idx
+                num_views = 2 + len(local_crops)
+                images_per_sec = (B * num_views) / max(batch_time, 1e-8)
+                samples_per_sec = B / max(batch_time, 1e-8)
+                amp_scale = float(scaler.get_scale()) if scaler.is_enabled() else 1.0
+
+                sys_metrics = {
+                    "sys/data_time_s": data_time,
+                    "sys/batch_time_s": batch_time,
+                    "sys/samples_per_sec": samples_per_sec,
+                    "sys/images_per_sec": images_per_sec,
+                }
+                if device.type == "cuda":
+                    sys_metrics.update(
+                        {
+                            "sys/cuda_mem_allocated_mb": torch.cuda.memory_allocated()
+                            / 1024**2,
+                            "sys/cuda_mem_reserved_mb": torch.cuda.memory_reserved()
+                            / 1024**2,
+                            "sys/cuda_max_mem_allocated_mb": torch.cuda.max_memory_allocated()
+                            / 1024**2,
+                        }
+                    )
+
                 wandb.log(
                     {
                         "step": global_step,
+                        "train/total_loss": loss.item(),
                         "train/loss": lejepa_loss.item(),
                         "train/sigreg": loss_dict["sigreg_loss"].item(),
                         "train/invariance": loss_dict["invariance_loss"].item(),
                         "train/probe_loss": probe_loss.item(),
                         "train/accuracy": 100 * total_correct / total_samples,
-                        "train/lr": scheduler.get_last_lr()[0],
+                        "train/batch_accuracy": batch_acc,
+                        "train/lr_encoder": lr_encoder,
+                        "train/lr_probe": lr_probe,
+                        "train/amp_scale": amp_scale,
                         "train/attn_entropy": current_entropy,
                         "train/attn_gini": current_gini,
                         "train/attn_sparsity": current_sparsity,
                         "train/attn_grad_norm": current_grad_norm,
+                        "attn/last_layer_effective_rank": attn_rank.get(
+                            "effective_rank", 0.0
+                        ),
+                        "attn/last_layer_spectral_norm": attn_rank.get(
+                            "spectral_norm", 0.0
+                        ),
+                        "attn/diag_mass": attn_struct.get("diag_mass", 0.0),
+                        "attn/cls_to_patches": attn_struct.get("cls_to_patches", 0.0),
+                        "attn/cls_self": attn_struct.get("cls_self", 0.0),
+                        "attn/patches_to_cls": attn_struct.get("patches_to_cls", 0.0),
+                        "attn/head_entropy_std": attn_struct.get(
+                            "head_entropy_std", 0.0
+                        ),
+                        "attn/patch_attn_distance_mean": attn_dist.get(
+                            "patch_attn_distance_mean", 0.0
+                        ),
+                        "attn/patch_attn_distance_std": attn_dist.get(
+                            "patch_attn_distance_std", 0.0
+                        ),
+                        "attn/patch_local_mass_r1": attn_dist.get(
+                            "patch_local_mass_r1", 0.0
+                        ),
+                        **attn_layer_metrics,
+                        "rep/norm_mean": rep_stats.get("norm_mean", 0.0),
+                        "rep/norm_std": rep_stats.get("norm_std", 0.0),
+                        "rep/variance": rep_stats.get("variance", 0.0),
+                        "rep/effective_dim": rep_stats.get("effective_dim", 0.0),
+                        "rep/isotropy": rep_stats.get("isotropy", 0.0),
+                        "rep/align_cos": align_stats.get("cos", 0.0),
+                        "rep/align_l2": align_stats.get("l2", 0.0),
+                        "rep/cov_offdiag_l2": cov_stats.get("cov_offdiag_l2", 0.0),
+                        "rep/cov_diag_mean": cov_stats.get("cov_diag_mean", 0.0),
+                        "rep/cov_diag_min": cov_stats.get("cov_diag_min", 0.0),
+                        "rep/var_mean": cov_stats.get("var_mean", 0.0),
+                        "rep/var_min": cov_stats.get("var_min", 0.0),
+                        "opt/encoder_param_norm": (
+                            opt_norms_model.get("param_norm", 0.0)
+                            if opt_norms_model
+                            else 0.0
+                        ),
+                        "opt/encoder_grad_norm": (
+                            opt_norms_model.get("grad_norm", 0.0)
+                            if opt_norms_model
+                            else 0.0
+                        ),
+                        "opt/encoder_grad_to_param": (
+                            opt_norms_model.get("grad_to_param", 0.0)
+                            if opt_norms_model
+                            else 0.0
+                        ),
+                        "opt/probe_param_norm": (
+                            opt_norms_probe.get("param_norm", 0.0)
+                            if opt_norms_probe
+                            else 0.0
+                        ),
+                        "opt/probe_grad_norm": (
+                            opt_norms_probe.get("grad_norm", 0.0)
+                            if opt_norms_probe
+                            else 0.0
+                        ),
+                        "opt/probe_grad_to_param": (
+                            opt_norms_probe.get("grad_to_param", 0.0)
+                            if opt_norms_probe
+                            else 0.0
+                        ),
+                        **sys_metrics,
                     }
                 )
+        else:
+            prev_iter_end = time.perf_counter()
 
     num_batches = len(train_loader)
     return {
@@ -286,6 +480,8 @@ def evaluate(
 
     total_correct = 0
     total_samples = 0
+    total_top5 = 0
+    total_loss = 0.0
 
     for views, labels in tqdm(val_loader, desc="Evaluating"):
         views = views.to(device, non_blocking=True)  # (B, 1, C, H, W)
@@ -296,13 +492,403 @@ def evaluate(
             emb, _ = model(views)
             logits = probe(emb)
 
+        loss = F.cross_entropy(logits, labels, reduction="sum")
+        total_loss += loss.item()
+
         pred = logits.argmax(dim=1)
         total_correct += (pred == labels).sum().item()
         total_samples += labels.size(0)
 
-    accuracy = 100 * total_correct / total_samples
-    return {"val_accuracy": accuracy}
+        k = min(5, logits.shape[1])
+        topk = logits.topk(k, dim=1).indices
+        total_top5 += topk.eq(labels.unsqueeze(1)).any(dim=1).sum().item()
 
+    accuracy = 100 * total_correct / max(total_samples, 1)
+    top5 = 100 * total_top5 / max(total_samples, 1)
+    avg_loss = total_loss / max(total_samples, 1)
+    return {"val_accuracy": accuracy, "val_top5": top5, "val_loss": avg_loss}
+
+
+@torch.no_grad()
+def evaluate_knn(
+    model: nn.Module,
+    val_loader,
+    device: torch.device,
+    num_classes: int = 20,
+    k: int = 20,
+    temperature: float = 0.07,
+    max_samples: int = 5000,
+    mixed_precision: bool = True,
+) -> dict:
+    """
+    kNN evaluation on embeddings (DINO-style weighted voting).
+
+    Uses leave-one-out kNN within the validation set (up to max_samples).
+    """
+    model.eval()
+
+    feats = []
+    labels_all = []
+    for views, labels in tqdm(val_loader, desc="Collecting kNN bank"):
+        views = views.to(device, non_blocking=True)
+        labels = labels.to(device, non_blocking=True)
+        with _autocast_ctx(device, enabled=mixed_precision):
+            emb, _ = model(views)
+        feats.append(emb.detach().float())
+        labels_all.append(labels.detach())
+        if sum(x.shape[0] for x in feats) >= max_samples:
+            break
+
+    if not feats:
+        return {"knn_top1": 0.0, "knn_top5": 0.0}
+
+    bank = torch.cat(feats, dim=0)[:max_samples]
+    bank_labels = torch.cat(labels_all, dim=0)[:max_samples]
+    bank = bank / (bank.norm(dim=1, keepdim=True) + 1e-8)
+
+    n = bank.shape[0]
+    if n < 2:
+        return {"knn_top1": 0.0, "knn_top5": 0.0}
+
+    k = min(k, n - 1)
+    correct1 = 0
+    correct5 = 0
+
+    # Query in chunks to limit peak memory
+    chunk = min(512, n)
+    for start in tqdm(range(0, n, chunk), desc="kNN eval"):
+        end = min(start + chunk, n)
+        q = bank[start:end]  # (B,D)
+        sims = q @ bank.T  # (B,N)
+
+        # exclude self
+        row = torch.arange(end - start, device=device)
+        sims[row, start + row] = float("-inf")
+
+        vals, idx = sims.topk(k, dim=1, largest=True, sorted=False)  # (B,k)
+        nn_labels = bank_labels[idx]  # (B,k)
+
+        # weighted vote
+        weights = (vals / max(temperature, 1e-6)).exp()  # (B,k)
+        scores = torch.zeros((end - start, num_classes), device=device)
+        scores.scatter_add_(1, nn_labels, weights)
+
+        pred = scores.argmax(dim=1)
+        true = bank_labels[start:end]
+        correct1 += (pred == true).sum().item()
+
+        topk5 = scores.topk(min(5, num_classes), dim=1).indices
+        correct5 += topk5.eq(true.unsqueeze(1)).any(dim=1).sum().item()
+
+    return {
+        "knn_top1": 100.0 * correct1 / n,
+        "knn_top5": 100.0 * correct5 / n,
+        "knn_samples": float(n),
+    }
+
+
+@torch.no_grad()
+def evaluate_intrinsic_dim(
+    model: nn.Module,
+    val_loader,
+    device: torch.device,
+    max_samples: int = 1024,
+    mixed_precision: bool = True,
+) -> dict:
+    """
+    Estimate intrinsic dimension of embeddings (TwoNN) on a subset of val set.
+    """
+    model.eval()
+    feats = []
+    for views, _labels in tqdm(val_loader, desc="Collecting for LID"):
+        views = views.to(device, non_blocking=True)
+        with _autocast_ctx(device, enabled=mixed_precision):
+            emb, _ = model(views)
+        feats.append(emb.detach().float())
+        if sum(x.shape[0] for x in feats) >= max_samples:
+            break
+    if not feats:
+        return {"intrinsic_dim_twonn": 0.0}
+    z = torch.cat(feats, dim=0)[:max_samples]
+    return {"intrinsic_dim_twonn": estimate_intrinsic_dim_twonn(z)}
+
+
+def _slice_crops(crops: list[torch.Tensor], start: int, end: int) -> list[torch.Tensor]:
+    return [c[start:end] for c in crops]
+
+
+def _compute_training_loss_from_crops(
+    model: nn.Module,
+    probe: LinearProbe,
+    loss_fn: LeJEPALoss,
+    crops: list[torch.Tensor],
+    labels: torch.Tensor,
+    device: torch.device,
+    mixed_precision: bool,
+) -> tuple[torch.Tensor, dict]:
+    """
+    Compute the same combined loss used during training on a batch of crops.
+    Returns (loss, aux_dict).
+    """
+    crops = [c.to(device, non_blocking=True) for c in crops]
+    labels = labels.to(device, non_blocking=True)
+
+    global_crops = crops[:2]
+    local_crops = crops[2:]
+    B = labels.shape[0]
+
+    with _autocast_ctx(device, enabled=mixed_precision):
+        global_crops_tensor = torch.stack(global_crops, dim=1)  # (B,2,C,H,W)
+        emb_global, proj_global = model(global_crops_tensor)
+
+        if local_crops:
+            local_crops_tensor = torch.stack(local_crops, dim=1)
+            _emb_local, proj_local = model(local_crops_tensor)
+            proj = torch.cat([proj_global, proj_local], dim=0)
+        else:
+            proj = proj_global
+
+        loss_dict = loss_fn(proj)
+        lejepa_loss = loss_dict["loss"]
+
+        probe_logits = probe(emb_global.detach())
+        probe_loss = F.cross_entropy(probe_logits, labels.repeat_interleave(2))
+        total_loss = lejepa_loss + probe_loss
+
+    return total_loss, {
+        "lejepa_loss": lejepa_loss.detach(),
+        "probe_loss": probe_loss.detach(),
+        "sigreg_loss": loss_dict.get("sigreg_loss", torch.tensor(0.0)).detach(),
+        "invariance_loss": loss_dict.get("invariance_loss", torch.tensor(0.0)).detach(),
+    }
+
+
+def _select_diag_params(model: nn.Module) -> list[tuple[str, torch.nn.Parameter]]:
+    """
+    Pick a manageable but informative parameter subset for expensive diagnostics.
+    Focus on normalization params (LayerNorm/RMSNorm/q_norm/k_norm) + final norms.
+    """
+    selected = []
+    for name, p in model.named_parameters():
+        if not p.requires_grad:
+            continue
+        lname = name.lower()
+        if any(k in lname for k in ["norm", "rmsnorm", "layernorm", "q_norm", "k_norm"]):
+            selected.append((name, p))
+    return selected
+
+
+def _flatten_grads(params: list[torch.nn.Parameter]) -> torch.Tensor:
+    vecs = []
+    for p in params:
+        if p.grad is None:
+            continue
+        vecs.append(p.grad.detach().float().reshape(-1))
+    if not vecs:
+        return torch.zeros(1)
+    return torch.cat(vecs, dim=0)
+
+
+def _gns_microbatch(
+    model: nn.Module,
+    probe: LinearProbe,
+    loss_fn: LeJEPALoss,
+    crops: list[torch.Tensor],
+    labels: torch.Tensor,
+    device: torch.device,
+    mixed_precision: bool,
+    microbatches: int,
+) -> dict:
+    """
+    Microbatch gradient noise proxy on a parameter subset.
+    Computes noise-to-signal ratio and cosine agreement across microbatches.
+    """
+    named = _select_diag_params(model)
+    params = [p for _n, p in named]
+    if not params:
+        return {"gns/noise_to_signal": 0.0, "gns/cos_to_mean": 0.0}
+
+    B = labels.shape[0]
+    mb = max(1, min(microbatches, B))
+    splits = torch.linspace(0, B, steps=mb + 1).long().tolist()
+
+    grads = []
+    norms = []
+    for i in range(mb):
+        s, e = splits[i], splits[i + 1]
+        if e - s < 1:
+            continue
+        model.zero_grad(set_to_none=True)
+        probe.zero_grad(set_to_none=True)
+        loss, _aux = _compute_training_loss_from_crops(
+            model, probe, loss_fn, _slice_crops(crops, s, e), labels[s:e], device, mixed_precision
+        )
+        loss.backward()
+        g = _flatten_grads(params)
+        grads.append(g)
+        norms.append(g.norm().item())
+
+    if len(grads) < 2:
+        return {"gns/noise_to_signal": 0.0, "gns/cos_to_mean": 0.0}
+
+    G = torch.stack(grads, dim=0)  # (M, P)
+    g_bar = G.mean(dim=0)
+    mean_sq = (G.pow(2).sum(dim=1)).mean()
+    sq_mean = g_bar.pow(2).sum()
+    noise = (mean_sq - sq_mean).clamp(min=0.0)
+    n2s = (noise / (sq_mean + 1e-12)).item()
+
+    gbar_n = g_bar / (g_bar.norm() + 1e-12)
+    cos = (G / (G.norm(dim=1, keepdim=True) + 1e-12)) @ gbar_n
+    cos_mean = cos.mean().item()
+    cos_std = cos.std().item()
+
+    return {
+        "gns/noise_to_signal": n2s,
+        "gns/cos_to_mean": cos_mean,
+        "gns/cos_to_mean_std": cos_std,
+        "gns/micro_grad_norm_mean": float(sum(norms) / len(norms)),
+        "gns/micro_grad_norm_std": float(torch.tensor(norms).std().item()),
+        "gns/num_params": float(G.shape[1]),
+        "gns/microbatches": float(len(grads)),
+    }
+
+
+def _hessian_top_eig_power_iter(
+    model: nn.Module,
+    probe: LinearProbe,
+    loss_fn: LeJEPALoss,
+    crops: list[torch.Tensor],
+    labels: torch.Tensor,
+    device: torch.device,
+    mixed_precision: bool,
+    iters: int,
+) -> dict:
+    """
+    Estimate top Hessian eigenvalue via power iteration on a parameter subset.
+    """
+    named = _select_diag_params(model)
+    params = [p for _n, p in named]
+    if not params:
+        return {"sharpness/top_hessian_eig": 0.0}
+
+    model.zero_grad(set_to_none=True)
+    probe.zero_grad(set_to_none=True)
+
+    loss, _aux = _compute_training_loss_from_crops(
+        model, probe, loss_fn, crops, labels, device, mixed_precision
+    )
+
+    grads = torch.autograd.grad(loss, params, create_graph=True, retain_graph=True, allow_unused=True)
+    vec = [torch.randn_like(p, dtype=torch.float32) for p in params]
+
+    def _normalize(vs: list[torch.Tensor]) -> list[torch.Tensor]:
+        nrm = torch.sqrt(
+            sum([(v.detach().float().pow(2).sum()) for v in vs]) + 1e-12
+        )
+        return [v / nrm for v in vs]
+
+    vec = _normalize(vec)
+
+    lam = 0.0
+    for _ in range(max(1, iters)):
+        dot = 0.0
+        for g, v in zip(grads, vec):
+            if g is None:
+                continue
+            dot = dot + (g.detach() * v).sum()
+        hv = torch.autograd.grad(dot, params, retain_graph=True, allow_unused=True)
+        hv = [torch.zeros_like(p, dtype=torch.float32) if h is None else h.detach().float() for p, h in zip(params, hv)]
+
+        # Rayleigh quotient
+        num = 0.0
+        den = 0.0
+        for v, h in zip(vec, hv):
+            num = num + (v.detach().float() * h).sum()
+            den = den + (v.detach().float().pow(2).sum())
+        lam = (num / (den + 1e-12)).item()
+        vec = _normalize(hv)
+
+    return {
+        "sharpness/top_hessian_eig": float(lam),
+        "sharpness/params_tracked": float(len(params)),
+    }
+
+
+@torch.no_grad()
+def _loss_landscape_slice(
+    model: nn.Module,
+    probe: LinearProbe,
+    loss_fn: LeJEPALoss,
+    crops: list[torch.Tensor],
+    labels: torch.Tensor,
+    device: torch.device,
+    mixed_precision: bool,
+    radius: float,
+    points: int,
+) -> dict:
+    """
+    Evaluate loss along two 1D slices in parameter space:
+      - gradient direction
+      - random direction
+    Uses the same training loss on the provided batch.
+    """
+    named = _select_diag_params(model)
+    params = [p for _n, p in named]
+    if not params:
+        return {"alphas": [], "losses_grad": [], "losses_rand": []}
+
+    # Compute base loss and gradient direction (on subset)
+    model.zero_grad(set_to_none=True)
+    probe.zero_grad(set_to_none=True)
+
+    base_loss, _aux = _compute_training_loss_from_crops(
+        model, probe, loss_fn, crops, labels, device, mixed_precision
+    )
+    grads = torch.autograd.grad(base_loss, params, retain_graph=False, allow_unused=True)
+    gdir = [torch.zeros_like(p) if g is None else g.detach().float() for p, g in zip(params, grads)]
+
+    def _norm(vs: list[torch.Tensor]) -> torch.Tensor:
+        return torch.sqrt(sum([v.float().pow(2).sum() for v in vs]) + 1e-12)
+
+    gnorm = _norm(gdir).item()
+    if gnorm > 0:
+        gdir = [v / gnorm for v in gdir]
+
+    rdir = [torch.randn_like(p, dtype=torch.float32) for p in params]
+    rnorm = _norm(rdir).item()
+    rdir = [v / (rnorm + 1e-12) for v in rdir]
+
+    # Scale by radius * param_norm to be somewhat comparable across runs
+    pnorm = _norm([p.detach().float() for p in params]).item()
+    scale = float(radius) * float(pnorm)
+
+    alphas = torch.linspace(-1.0, 1.0, steps=max(3, points)).tolist()
+    losses_grad = []
+    losses_rand = []
+
+    # Save originals
+    originals = [p.detach().clone() for p in params]
+
+    def _set_params(direction: list[torch.Tensor], alpha: float):
+        for p, p0, d in zip(params, originals, direction):
+            p.copy_(p0 + (alpha * scale) * d.to(p.device, dtype=p.dtype))
+
+    for a in alphas:
+        _set_params(gdir, float(a))
+        l, _ = _compute_training_loss_from_crops(model, probe, loss_fn, crops, labels, device, mixed_precision)
+        losses_grad.append(float(l.detach().item()))
+
+    for a in alphas:
+        _set_params(rdir, float(a))
+        l, _ = _compute_training_loss_from_crops(model, probe, loss_fn, crops, labels, device, mixed_precision)
+        losses_rand.append(float(l.detach().item()))
+
+    # Restore
+    for p, p0 in zip(params, originals):
+        p.copy_(p0)
+
+    return {"alphas": alphas, "losses_grad": losses_grad, "losses_rand": losses_rand}
 
 def count_parameters(model: nn.Module) -> int:
     """Count trainable parameters."""
@@ -374,8 +960,23 @@ def main():
             wandb.define_metric("step")
             wandb.define_metric("epoch")
             wandb.define_metric("train/*", step_metric="step")
+            wandb.define_metric("opt/*", step_metric="step")
+            wandb.define_metric("rep/*", step_metric="step")
+            wandb.define_metric("sys/*", step_metric="step")
+            wandb.define_metric("attn/*", step_metric="step")
+            wandb.define_metric("attn_layer/*", step_metric="step")
             wandb.define_metric("epoch_*", step_metric="epoch")
             wandb.define_metric("val_*", step_metric="epoch")
+            wandb.define_metric("attention/*", step_metric="epoch")
+            wandb.define_metric("collapse/*", step_metric="epoch")
+            wandb.define_metric("epoch_rep/*", step_metric="epoch")
+            wandb.define_metric("knn/*", step_metric="epoch")
+            wandb.define_metric("lid/*", step_metric="epoch")
+            wandb.define_metric("epoch_attn_layer/*", step_metric="epoch")
+            wandb.define_metric("epoch_block/*", step_metric="epoch")
+            wandb.define_metric("epoch_opt/*", step_metric="epoch")
+            wandb.define_metric("gns/*", step_metric="epoch")
+            wandb.define_metric("sharpness/*", step_metric="epoch")
         except ImportError:
             print("wandb not installed, skipping logging")
             config.use_wandb = False
@@ -430,6 +1031,9 @@ def main():
     loss_fn = LeJEPALoss(
         lambda_sigreg=config.lambda_sigreg,
         knots=config.sigreg_num_knots,
+        multivariate=config.sigreg_multivariate,
+        num_frequencies=config.sigreg_num_frequencies,
+        sigma=config.sigreg_sigma,
     )
 
     # Create optimizers with separate weight decay (matching reference)
@@ -509,6 +1113,9 @@ def main():
         generate_gradient_flow_heatmap,
         generate_embedding_projection,
         generate_collapse_monitor,
+        generate_embedding_spectrum,
+        generate_layerwise_curves,
+        generate_loss_landscape_slice,
         generate_training_dashboard,
         AttentionTracker,
     )
@@ -533,6 +1140,11 @@ def main():
     entropy_history = []
     gini_history = []
     lr_history = []
+
+    prev_rep_nette = None
+    prev_rep_woof = None
+    prev_block_reps_nette = None
+    prev_block_reps_woof = None
 
     for epoch in range(1, config.epochs + 1):
         start_time = time.time()
@@ -582,10 +1194,60 @@ def main():
                         "optimizer_state_dict": optimizer.state_dict(),
                         "val_accuracy": acc_nette,
                         "val_accuracy_woof": acc_woof,
+                        "val_top5": val_metrics_nette.get("val_top5", 0.0),
+                        "val_top5_woof": val_metrics_woof.get("val_top5", 0.0),
+                        "val_loss": val_metrics_nette.get("val_loss", 0.0),
+                        "val_loss_woof": val_metrics_woof.get("val_loss", 0.0),
                         "config": vars(config),
                     },
                     output_dir / "best_model.pt",
                 )
+
+        knn_metrics_nette = {}
+        knn_metrics_woof = {}
+        lid_metrics_nette = {}
+        lid_metrics_woof = {}
+        if config.use_wandb and epoch % config.knn_interval == 0:
+            print("kNN eval on ImageNette embeddings...")
+            knn_metrics_nette = evaluate_knn(
+                model,
+                val_loader_nette,
+                device,
+                num_classes=20,
+                k=config.knn_k,
+                temperature=config.knn_temperature,
+                max_samples=config.knn_max_samples,
+                mixed_precision=config.mixed_precision,
+            )
+            print("kNN eval on ImageWoof embeddings...")
+            knn_metrics_woof = evaluate_knn(
+                model,
+                val_loader_woof,
+                device,
+                num_classes=20,
+                k=config.knn_k,
+                temperature=config.knn_temperature,
+                max_samples=config.knn_max_samples,
+                mixed_precision=config.mixed_precision,
+            )
+
+        if config.use_wandb and epoch % config.lid_interval == 0:
+            print("Intrinsic dimension (TwoNN) on ImageNette embeddings...")
+            lid_metrics_nette = evaluate_intrinsic_dim(
+                model,
+                val_loader_nette,
+                device,
+                max_samples=config.lid_max_samples,
+                mixed_precision=config.mixed_precision,
+            )
+            print("Intrinsic dimension (TwoNN) on ImageWoof embeddings...")
+            lid_metrics_woof = evaluate_intrinsic_dim(
+                model,
+                val_loader_woof,
+                device,
+                max_samples=config.lid_max_samples,
+                mixed_precision=config.mixed_precision,
+            )
 
         # Log metrics
         epoch_time = time.time() - start_time
@@ -596,9 +1258,11 @@ def main():
         print(f"  Train Acc: {train_metrics['accuracy']:.2f}%")
         if val_metrics_nette:
             print(
-                f"  Val Acc (Nette): {val_metrics_nette['val_accuracy']:.2f}% (Best: {best_val_acc:.2f}%)"
+                f"  Val Acc (Nette): {val_metrics_nette['val_accuracy']:.2f}% (Top-5: {val_metrics_nette.get('val_top5', 0):.2f}%, Loss: {val_metrics_nette.get('val_loss', 0):.4f}, Best: {best_val_acc:.2f}%)"
             )
-            print(f"  Val Acc (Woof): {val_metrics_woof['val_accuracy']:.2f}%")
+            print(
+                f"  Val Acc (Woof): {val_metrics_woof['val_accuracy']:.2f}% (Top-5: {val_metrics_woof.get('val_top5', 0):.2f}%, Loss: {val_metrics_woof.get('val_loss', 0):.4f})"
+            )
         print(f"  Time: {epoch_time:.1f}s")
 
         if config.use_wandb:
@@ -614,6 +1278,16 @@ def main():
                     "epoch_train_accuracy": train_metrics["accuracy"],
                     "val_accuracy_nette": val_metrics_nette.get("val_accuracy", 0),
                     "val_accuracy_woof": val_metrics_woof.get("val_accuracy", 0),
+                    "val_top5_nette": val_metrics_nette.get("val_top5", 0),
+                    "val_top5_woof": val_metrics_woof.get("val_top5", 0),
+                    "val_loss_nette": val_metrics_nette.get("val_loss", 0),
+                    "val_loss_woof": val_metrics_woof.get("val_loss", 0),
+                    "knn/nette_top1": knn_metrics_nette.get("knn_top1", 0),
+                    "knn/nette_top5": knn_metrics_nette.get("knn_top5", 0),
+                    "knn/woof_top1": knn_metrics_woof.get("knn_top1", 0),
+                    "knn/woof_top5": knn_metrics_woof.get("knn_top5", 0),
+                    "lid/nette_twonn": lid_metrics_nette.get("intrinsic_dim_twonn", 0),
+                    "lid/woof_twonn": lid_metrics_woof.get("intrinsic_dim_twonn", 0),
                     "best_val_accuracy": best_val_acc,
                 }
             )
@@ -660,8 +1334,10 @@ def main():
                         model,
                         vis_images_nette,
                         device,
-                        img_size=config.img_size,
+                        img_size=config.pca_vis_size,
                         patch_size=config.patch_size,
+                        pca_resample=config.pca_resample,
+                        per_image_pca=config.pca_per_image,
                     )
                     vis_frames_nette.append(vis_grid_nette)
                     if config.use_wandb:
@@ -727,8 +1403,10 @@ def main():
                         model,
                         vis_images_woof,
                         device,
-                        img_size=config.img_size,
+                        img_size=config.pca_vis_size,
                         patch_size=config.patch_size,
+                        pca_resample=config.pca_resample,
+                        per_image_pca=config.pca_per_image,
                     )
                     vis_frames_woof.append(vis_grid_woof)
                     if config.use_wandb:
@@ -891,16 +1569,71 @@ def main():
                             commit=False,
                         )
 
+                # 9b. Representation drift (lightweight): cosine + linear CKA
+                if epoch % config.drift_interval == 0 and config.use_wandb:
+                    import wandb
+
+                    def _drift_metrics(tag: str, prev: torch.Tensor, cur: torch.Tensor) -> dict:
+                        if prev is None or cur is None:
+                            return {}
+                        b = min(prev.shape[0], cur.shape[0])
+                        if b < 2:
+                            return {}
+                        p = prev[:b].float()
+                        c = cur[:b].float()
+
+                        p_n = p / (p.norm(dim=1, keepdim=True) + 1e-8)
+                        c_n = c / (c.norm(dim=1, keepdim=True) + 1e-8)
+                        cos = (p_n * c_n).sum(dim=1).mean().item()
+                        l2 = (p_n - c_n).pow(2).sum(dim=1).mean().item()
+                        cka = compute_linear_cka(p, c)
+                        return {
+                            f"epoch_rep/drift_cos_{tag}": cos,
+                            f"epoch_rep/drift_l2_{tag}": l2,
+                            f"epoch_rep/drift_cka_{tag}": cka,
+                        }
+
+                    # Nette drift
+                    cur_rep_nette = None
+                    if vis_images_nette is not None:
+                        with torch.no_grad():
+                            cur_rep_nette, _ = model(vis_images_nette.unsqueeze(1))
+                        wandb.log(
+                            _drift_metrics("nette", prev_rep_nette, cur_rep_nette),
+                            commit=False,
+                        )
+                        prev_rep_nette = cur_rep_nette.detach()
+
+                    # Woof drift
+                    cur_rep_woof = None
+                    if vis_images_woof is not None:
+                        with torch.no_grad():
+                            cur_rep_woof, _ = model(vis_images_woof.unsqueeze(1))
+                        wandb.log(
+                            _drift_metrics("woof", prev_rep_woof, cur_rep_woof),
+                            commit=False,
+                        )
+                        prev_rep_woof = cur_rep_woof.detach()
+
                 # 10. Feature Collapse Monitor (every 5 epochs)
                 if epoch % config.collapse_monitor_interval == 0:
                     with torch.no_grad():
                         emb_sample, _ = model(vis_images.unsqueeze(1))
                     collapse_vis = generate_collapse_monitor(emb_sample)
+                    spectrum_vis = generate_embedding_spectrum(emb_sample)
                     if config.use_wandb:
                         wandb.log(
                             {
                                 "collapse_monitor": wandb.Image(
                                     collapse_vis, caption=f"Epoch {epoch}"
+                                )
+                            },
+                            commit=False,
+                        )
+                        wandb.log(
+                            {
+                                "epoch_rep/embedding_spectrum": wandb.Image(
+                                    spectrum_vis, caption=f"Epoch {epoch}"
                                 )
                             },
                             commit=False,
@@ -920,7 +1653,112 @@ def main():
                                 ],
                                 "collapse/uniformity": collapse_metrics["uniformity"],
                             },
+                                commit=False,
+                            )
+
+                # 10b. Block-wise activation diagnostics (token norms + residual ratios + drift)
+                if epoch % config.block_diag_interval == 0 and config.use_wandb:
+                    import wandb
+
+                    def _collect_block_stats(images: torch.Tensor) -> tuple[dict, list]:
+                        block_stats = {}
+                        block_reps = []
+
+                        has_cls = getattr(model.encoder, "pool", "") == "cls"
+                        handles = []
+
+                        def _make_hook(li: int):
+                            def _hook(mod, inp, out):
+                                x_in = inp[0].detach()
+                                x_out = out.detach()
+                                x_in_f = x_in.float()
+                                x_out_f = x_out.float()
+
+                                token_norm = x_out_f.norm(dim=-1)  # (B,N)
+                                block_stats[f"epoch_block/token_norm_mean/l{li}"] = (
+                                    token_norm.mean().item()
+                                )
+                                if has_cls and x_out_f.shape[1] > 1:
+                                    block_stats[f"epoch_block/cls_norm_mean/l{li}"] = (
+                                        token_norm[:, 0].mean().item()
+                                    )
+                                    block_stats[f"epoch_block/patch_norm_mean/l{li}"] = (
+                                        token_norm[:, 1:].mean().item()
+                                    )
+
+                                delta = (x_out_f - x_in_f).norm(dim=-1)
+                                base = x_in_f.norm(dim=-1).clamp(min=1e-8)
+                                block_stats[f"epoch_block/residual_ratio/l{li}"] = (
+                                    (delta / base).mean().item()
+                                )
+                                if has_cls and x_out_f.shape[1] > 1:
+                                    block_stats[
+                                        f"epoch_block/residual_ratio_cls/l{li}"
+                                    ] = (delta[:, 0] / base[:, 0]).mean().item()
+                                    block_stats[
+                                        f"epoch_block/residual_ratio_patch/l{li}"
+                                    ] = (delta[:, 1:] / base[:, 1:]).mean().item()
+
+                                # pooled rep for drift (CLS if present else mean tokens)
+                                rep = x_out_f[:, 0] if has_cls else x_out_f.mean(dim=1)
+                                block_reps.append(rep.detach())
+
+                            return _hook
+
+                        for li, blk in enumerate(model.encoder.blocks):
+                            handles.append(blk.register_forward_hook(_make_hook(li)))
+
+                        _ = model.encoder(images)
+
+                        for h in handles:
+                            h.remove()
+
+                        # parameter norm per block (cheap sanity)
+                        for li, blk in enumerate(model.encoder.blocks):
+                            sq = 0.0
+                            for p in blk.parameters():
+                                sq += p.detach().float().pow(2).sum().item()
+                            block_stats[f"epoch_block/param_norm/l{li}"] = (sq + 1e-12) ** 0.5
+
+                        return block_stats, block_reps
+
+                    def _log_block(tag: str, images: torch.Tensor, prev_reps: list | None):
+                        stats, reps = _collect_block_stats(images)
+                        drift = {}
+                        if prev_reps is not None and len(prev_reps) == len(reps):
+                            for li, (p, c) in enumerate(zip(prev_reps, reps)):
+                                b = min(p.shape[0], c.shape[0])
+                                if b < 2:
+                                    continue
+                                p_n = p[:b] / (p[:b].norm(dim=1, keepdim=True) + 1e-8)
+                                c_n = c[:b] / (c[:b].norm(dim=1, keepdim=True) + 1e-8)
+                                drift[f"epoch_block/{tag}_drift_cos/l{li}"] = (
+                                    (p_n * c_n).sum(dim=1).mean().item()
+                                )
+                        wandb.log({**stats, **drift}, commit=False)
+
+                        # Curves for quick scanning
+                        depth = len(model.encoder.blocks)
+                        tok = [stats.get(f"epoch_block/token_norm_mean/l{i}", 0.0) for i in range(depth)]
+                        res = [stats.get(f"epoch_block/residual_ratio/l{i}", 0.0) for i in range(depth)]
+                        plot = generate_layerwise_curves(
+                            {"token_norm_mean": tok, "residual_ratio": res},
+                            title=f"Block Diagnostics ({tag}) Epoch {epoch}",
+                            ylabel="value",
+                        )
+                        wandb.log(
+                            {f"epoch_block/{tag}_diagnostics_plot": wandb.Image(plot, caption=f"Epoch {epoch}")},
                             commit=False,
+                        )
+                        return reps
+
+                    if vis_images_nette is not None:
+                        prev_block_reps_nette = _log_block(
+                            "nette", vis_images_nette, prev_block_reps_nette
+                        )
+                    if vis_images_woof is not None:
+                        prev_block_reps_woof = _log_block(
+                            "woof", vis_images_woof, prev_block_reps_woof
                         )
 
                 # 11. Gradient Flow Heatmap (every 5 epochs, after backward)
@@ -968,6 +1806,90 @@ def main():
                                 commit=False,
                             )
 
+                        # Per-layer attention sink + diagonal diagnostics (epoch-level on fixed batch)
+                        if epoch % config.transformer_diag_interval == 0:
+                            layer_p2c = []
+                            layer_c2p = []
+                            layer_diag = []
+                            layer_head_ent = []
+                            layer_head_ent_std = []
+                            layer_attn_dist = []
+                            layer_local_r1 = []
+                            eps = 1e-8
+
+                            epoch_attn_layer = {}
+                            for li, a in enumerate(attns):
+                                m = compute_attention_structure_metrics(a)
+                                layer_p2c.append(m.get("patches_to_cls", 0.0))
+                                layer_c2p.append(m.get("cls_to_patches", 0.0))
+                                layer_diag.append(m.get("diag_mass", 0.0))
+
+                                head_ent = -(a * torch.log(a + eps)).sum(dim=-1).mean(dim=-1)  # (B,H)
+                                layer_head_ent.append(head_ent.mean().item())
+                                layer_head_ent_std.append(head_ent.std(dim=1).mean().item())
+
+                                epoch_attn_layer[f"epoch_attn_layer/patches_to_cls/l{li}"] = m.get(
+                                    "patches_to_cls", 0.0
+                                )
+                                epoch_attn_layer[f"epoch_attn_layer/cls_to_patches/l{li}"] = m.get(
+                                    "cls_to_patches", 0.0
+                                )
+                                epoch_attn_layer[f"epoch_attn_layer/diag_mass/l{li}"] = m.get(
+                                    "diag_mass", 0.0
+                                )
+                                epoch_attn_layer[f"epoch_attn_layer/head_entropy_mean/l{li}"] = head_ent.mean().item()
+                                epoch_attn_layer[f"epoch_attn_layer/head_entropy_std/l{li}"] = head_ent.std(dim=1).mean().item()
+
+                                d = compute_attention_distance_metrics(
+                                    a, grid_size=config.img_size // config.patch_size, radius=1
+                                )
+                                layer_attn_dist.append(d.get("patch_attn_distance_mean", 0.0))
+                                layer_local_r1.append(d.get("patch_local_mass_r1", 0.0))
+                                epoch_attn_layer[
+                                    f"epoch_attn_layer/patch_attn_distance_mean/l{li}"
+                                ] = d.get("patch_attn_distance_mean", 0.0)
+                                epoch_attn_layer[
+                                    f"epoch_attn_layer/patch_local_mass_r1/l{li}"
+                                ] = d.get("patch_local_mass_r1", 0.0)
+
+                            if config.use_wandb:
+                                wandb.log(epoch_attn_layer, commit=False)
+                                attn_plot = generate_layerwise_curves(
+                                    {
+                                        "patches→CLS": layer_p2c,
+                                        "CLS→patches": layer_c2p,
+                                        "diag_mass": layer_diag,
+                                        "head_entropy_mean": layer_head_ent,
+                                    },
+                                    title=f"Transformer Attention Diagnostics (Epoch {epoch})",
+                                    ylabel="value",
+                                )
+                                wandb.log(
+                                    {
+                                        "epoch_attn_layer/diagnostics_plot": wandb.Image(
+                                            attn_plot, caption=f"Epoch {epoch}"
+                                        )
+                                    },
+                                    commit=False,
+                                )
+
+                                dist_plot = generate_layerwise_curves(
+                                    {
+                                        "attn_distance_mean": layer_attn_dist,
+                                        "local_mass_r1": layer_local_r1,
+                                    },
+                                    title=f"Attention Distance/Locality (Epoch {epoch})",
+                                    ylabel="value",
+                                )
+                                wandb.log(
+                                    {
+                                        "epoch_attn_layer/distance_plot": wandb.Image(
+                                            dist_plot, caption=f"Epoch {epoch}"
+                                        )
+                                    },
+                                    commit=False,
+                                )
+
                 # 13. Training Dashboard (every 10 epochs)
                 if epoch % config.training_dashboard_interval == 0 and len(loss_history) > 1:
                     dashboard = generate_training_dashboard(
@@ -984,8 +1906,8 @@ def main():
                                     dashboard, caption=f"Epoch {epoch}"
                                 )
                             },
-                            commit=False,
-                        )
+                                commit=False,
+                            )
 
                 # 14. t-SNE Embedding Projection (every 20 epochs - expensive)
                 if epoch % config.embedding_projection_interval == 0:
@@ -1008,6 +1930,89 @@ def main():
                             )
                     except Exception as e:
                         print(f"t-SNE visualization failed: {e}")
+
+                # 15. Expensive optimization diagnostics (can be slow)
+                if config.use_wandb and epoch % config.gns_interval == 0:
+                    try:
+                        diag_crops, diag_labels = next(iter(train_loader))
+                        b = min(config.diagnostic_batch_size, diag_labels.shape[0])
+                        diag_crops = [c[:b] for c in diag_crops]
+                        diag_labels = diag_labels[:b]
+                        gns = _gns_microbatch(
+                            model,
+                            probe,
+                            loss_fn,
+                            diag_crops,
+                            diag_labels,
+                            device,
+                            mixed_precision=config.mixed_precision,
+                            microbatches=config.gns_microbatches,
+                        )
+                        wandb.log(gns, commit=False)
+                    except Exception as e:
+                        print(f"GNS diagnostics failed: {e}")
+
+                if config.use_wandb and epoch % config.sharpness_interval == 0:
+                    try:
+                        diag_crops, diag_labels = next(iter(train_loader))
+                        b = min(config.diagnostic_batch_size, diag_labels.shape[0])
+                        diag_crops = [c[:b] for c in diag_crops]
+                        diag_labels = diag_labels[:b]
+                        sharp = _hessian_top_eig_power_iter(
+                            model,
+                            probe,
+                            loss_fn,
+                            diag_crops,
+                            diag_labels,
+                            device,
+                            mixed_precision=config.mixed_precision,
+                            iters=config.sharpness_power_iters,
+                        )
+                        wandb.log(sharp, commit=False)
+                    except Exception as e:
+                        print(f"Sharpness diagnostics failed: {e}")
+
+                if config.use_wandb and epoch % config.landscape_interval == 0:
+                    try:
+                        diag_crops, diag_labels = next(iter(train_loader))
+                        b = min(config.diagnostic_batch_size, diag_labels.shape[0])
+                        diag_crops = [c[:b] for c in diag_crops]
+                        diag_labels = diag_labels[:b]
+                        ls = _loss_landscape_slice(
+                            model,
+                            probe,
+                            loss_fn,
+                            diag_crops,
+                            diag_labels,
+                            device,
+                            mixed_precision=config.mixed_precision,
+                            radius=config.landscape_radius,
+                            points=config.landscape_points,
+                        )
+                        if ls["alphas"]:
+                            plot_g = generate_loss_landscape_slice(
+                                ls["alphas"],
+                                ls["losses_grad"],
+                                title=f"Loss Landscape Slice (grad dir) Epoch {epoch}",
+                            )
+                            plot_r = generate_loss_landscape_slice(
+                                ls["alphas"],
+                                ls["losses_rand"],
+                                title=f"Loss Landscape Slice (random dir) Epoch {epoch}",
+                            )
+                            wandb.log(
+                                {
+                                    "epoch_opt/loss_landscape_grad": wandb.Image(
+                                        plot_g, caption=f"Epoch {epoch}"
+                                    ),
+                                    "epoch_opt/loss_landscape_rand": wandb.Image(
+                                        plot_r, caption=f"Epoch {epoch}"
+                                    ),
+                                },
+                                commit=False,
+                            )
+                    except Exception as e:
+                        print(f"Loss landscape diagnostics failed: {e}")
 
             except Exception as e:
                 print(f"Error generating visualization: {e}")
@@ -1032,7 +2037,11 @@ def main():
     val_metrics_woof = evaluate(model, probe, val_loader_woof, device, config)
 
     print(f"Final Val Accuracy (Nette): {val_metrics_nette['val_accuracy']:.2f}%")
+    print(f"Final Val Top-5 (Nette): {val_metrics_nette.get('val_top5', 0):.2f}%")
+    print(f"Final Val Loss (Nette): {val_metrics_nette.get('val_loss', 0):.4f}")
     print(f"Final Val Accuracy (Woof): {val_metrics_woof['val_accuracy']:.2f}%")
+    print(f"Final Val Top-5 (Woof): {val_metrics_woof.get('val_top5', 0):.2f}%")
+    print(f"Final Val Loss (Woof): {val_metrics_woof.get('val_loss', 0):.4f}")
     print(f"Best Val Accuracy: {best_val_acc:.2f}%")
 
     # Save final model
@@ -1057,7 +2066,11 @@ def main():
         wandb.run.summary["final_val_accuracy_nette"] = val_metrics_nette[
             "val_accuracy"
         ]
+        wandb.run.summary["final_val_top5_nette"] = val_metrics_nette.get("val_top5", 0)
+        wandb.run.summary["final_val_loss_nette"] = val_metrics_nette.get("val_loss", 0)
         wandb.run.summary["final_val_accuracy_woof"] = val_metrics_woof["val_accuracy"]
+        wandb.run.summary["final_val_top5_woof"] = val_metrics_woof.get("val_top5", 0)
+        wandb.run.summary["final_val_loss_woof"] = val_metrics_woof.get("val_loss", 0)
         wandb.finish()
 
     print(f"\nTraining complete! Models saved to {output_dir}")

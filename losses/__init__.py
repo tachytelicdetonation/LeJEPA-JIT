@@ -1,5 +1,5 @@
 """Loss functions for LeJEPA-JiT."""
 
-from .sigreg import SIGReg, LeJEPALoss
+from .sigreg import LeJEPALoss, MultivariateSIGReg, SIGReg
 
-__all__ = ["SIGReg", "LeJEPALoss"]
+__all__ = ["LeJEPALoss", "MultivariateSIGReg", "SIGReg"]
