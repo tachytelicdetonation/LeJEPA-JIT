@@ -854,7 +854,6 @@ def _hessian_top_eig_power_iter(
     }
 
 
-@torch.no_grad()
 def _loss_landscape_slice(
     model: nn.Module,
     probe: LinearProbe,
@@ -877,15 +876,21 @@ def _loss_landscape_slice(
     if not params:
         return {"alphas": [], "losses_grad": [], "losses_rand": []}
 
-    # Compute base loss and gradient direction (on subset)
-    model.zero_grad(set_to_none=True)
-    probe.zero_grad(set_to_none=True)
+    # Compute base loss and gradient direction (on subset) with grad enabled.
+    with torch.enable_grad():
+        model.zero_grad(set_to_none=True)
+        probe.zero_grad(set_to_none=True)
 
-    base_loss, _aux = _compute_training_loss_from_crops(
-        model, probe, loss_fn, crops, labels, device, mixed_precision
-    )
-    grads = torch.autograd.grad(base_loss, params, retain_graph=False, allow_unused=True)
-    gdir = [torch.zeros_like(p) if g is None else g.detach().float() for p, g in zip(params, grads)]
+        base_loss, _aux = _compute_training_loss_from_crops(
+            model, probe, loss_fn, crops, labels, device, mixed_precision
+        )
+        grads = torch.autograd.grad(
+            base_loss, params, retain_graph=False, allow_unused=True
+        )
+        gdir = [
+            torch.zeros_like(p) if g is None else g.detach().float()
+            for p, g in zip(params, grads)
+        ]
 
     def _norm(vs: list[torch.Tensor]) -> torch.Tensor:
         return torch.sqrt(sum([v.float().pow(2).sum() for v in vs]) + 1e-12)
@@ -913,15 +918,20 @@ def _loss_landscape_slice(
         for p, p0, d in zip(params, originals, direction):
             p.copy_(p0 + (alpha * scale) * d.to(p.device, dtype=p.dtype))
 
-    for a in alphas:
-        _set_params(gdir, float(a))
-        l, _ = _compute_training_loss_from_crops(model, probe, loss_fn, crops, labels, device, mixed_precision)
-        losses_grad.append(float(l.detach().item()))
+    with torch.no_grad():
+        for a in alphas:
+            _set_params(gdir, float(a))
+            l, _ = _compute_training_loss_from_crops(
+                model, probe, loss_fn, crops, labels, device, mixed_precision
+            )
+            losses_grad.append(float(l.detach().item()))
 
-    for a in alphas:
-        _set_params(rdir, float(a))
-        l, _ = _compute_training_loss_from_crops(model, probe, loss_fn, crops, labels, device, mixed_precision)
-        losses_rand.append(float(l.detach().item()))
+        for a in alphas:
+            _set_params(rdir, float(a))
+            l, _ = _compute_training_loss_from_crops(
+                model, probe, loss_fn, crops, labels, device, mixed_precision
+            )
+            losses_rand.append(float(l.detach().item()))
 
     # Restore
     for p, p0 in zip(params, originals):
@@ -2261,16 +2271,17 @@ def main():
                         b = min(config.diagnostic_batch_size, diag_labels.shape[0])
                         diag_crops = [c[:b] for c in diag_crops]
                         diag_labels = diag_labels[:b]
-                        gns = _gns_microbatch(
-                            model,
-                            probe,
-                            loss_fn,
-                            diag_crops,
-                            diag_labels,
-                            device,
-                            mixed_precision=config.mixed_precision,
-                            microbatches=config.gns_microbatches,
-                        )
+                        with torch.enable_grad():
+                            gns = _gns_microbatch(
+                                model,
+                                probe,
+                                loss_fn,
+                                diag_crops,
+                                diag_labels,
+                                device,
+                                mixed_precision=config.mixed_precision,
+                                microbatches=config.gns_microbatches,
+                            )
                         wandb.log(gns, commit=False)
                     except Exception as e:
                         print(f"GNS diagnostics failed: {e}")
@@ -2281,16 +2292,17 @@ def main():
                         b = min(config.diagnostic_batch_size, diag_labels.shape[0])
                         diag_crops = [c[:b] for c in diag_crops]
                         diag_labels = diag_labels[:b]
-                        sharp = _hessian_top_eig_power_iter(
-                            model,
-                            probe,
-                            loss_fn,
-                            diag_crops,
-                            diag_labels,
-                            device,
-                            mixed_precision=config.mixed_precision,
-                            iters=config.sharpness_power_iters,
-                        )
+                        with torch.enable_grad():
+                            sharp = _hessian_top_eig_power_iter(
+                                model,
+                                probe,
+                                loss_fn,
+                                diag_crops,
+                                diag_labels,
+                                device,
+                                mixed_precision=config.mixed_precision,
+                                iters=config.sharpness_power_iters,
+                            )
                         wandb.log(sharp, commit=False)
                     except Exception as e:
                         print(f"Sharpness diagnostics failed: {e}")
@@ -2301,17 +2313,18 @@ def main():
                         b = min(config.diagnostic_batch_size, diag_labels.shape[0])
                         diag_crops = [c[:b] for c in diag_crops]
                         diag_labels = diag_labels[:b]
-                        ls = _loss_landscape_slice(
-                            model,
-                            probe,
-                            loss_fn,
-                            diag_crops,
-                            diag_labels,
-                            device,
-                            mixed_precision=config.mixed_precision,
-                            radius=config.landscape_radius,
-                            points=config.landscape_points,
-                        )
+                        with torch.enable_grad():
+                            ls = _loss_landscape_slice(
+                                model,
+                                probe,
+                                loss_fn,
+                                diag_crops,
+                                diag_labels,
+                                device,
+                                mixed_precision=config.mixed_precision,
+                                radius=config.landscape_radius,
+                                points=config.landscape_points,
+                            )
                         if ls["alphas"]:
                             plot_g = generate_loss_landscape_slice(
                                 ls["alphas"],
@@ -2343,17 +2356,18 @@ def main():
                         b = min(config.diagnostic_batch_size, diag_labels.shape[0])
                         diag_crops = [c[:b] for c in diag_crops]
                         diag_labels = diag_labels[:b]
-                        ls2 = _loss_landscape_2d(
-                            model,
-                            probe,
-                            loss_fn,
-                            diag_crops,
-                            diag_labels,
-                            device,
-                            mixed_precision=config.mixed_precision,
-                            radius=config.landscape2d_radius,
-                            points=config.landscape2d_points,
-                        )
+                        with torch.enable_grad():
+                            ls2 = _loss_landscape_2d(
+                                model,
+                                probe,
+                                loss_fn,
+                                diag_crops,
+                                diag_labels,
+                                device,
+                                mixed_precision=config.mixed_precision,
+                                radius=config.landscape2d_radius,
+                                points=config.landscape2d_points,
+                            )
                         if ls2["alphas"] and ls2["betas"] and ls2["loss_grid"]:
                             plot2d = generate_loss_landscape_2d(
                                 ls2["alphas"],
@@ -2409,6 +2423,28 @@ def main():
 
             except Exception as e:
                 print(f"Error generating visualization: {e}")
+
+            # Ensure we don't keep large cached tensors from visualization passes.
+            for blk in getattr(model.encoder, "blocks", []):
+                attn = getattr(blk, "attn", None)
+                if attn is None:
+                    continue
+                if hasattr(attn, "output_attention"):
+                    attn.output_attention = False
+                if hasattr(attn, "output_attn_logits"):
+                    attn.output_attn_logits = False
+                if hasattr(attn, "attn_map"):
+                    attn.attn_map = None
+                if hasattr(attn, "attn_logits"):
+                    attn.attn_logits = None
+                if hasattr(attn, "head_mask"):
+                    attn.head_mask = None
+
+            import gc
+
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
 
         # Save checkpoint
         if epoch % config.save_interval == 0:

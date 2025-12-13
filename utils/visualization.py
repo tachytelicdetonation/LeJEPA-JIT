@@ -208,12 +208,19 @@ def generate_attention_distance_per_head_heatmap(
     for block in model.encoder.blocks:
         block.attn.output_attention = True
 
-    images = images.to(device)
+    images = images.to(device, non_blocking=True)
     _ = model.encoder(images)
-    attentions = model.encoder.get_attention_maps()
+    # Materialize maps and move to CPU to avoid holding large tensors on GPU.
+    attentions = []
+    for a in model.encoder.get_attention_maps():
+        if a is None:
+            continue
+        attentions.append(a.detach().float().cpu())
 
     for block in model.encoder.blocks:
         block.attn.output_attention = False
+        if hasattr(block.attn, "attn_map"):
+            block.attn.attn_map = None
 
     if not attentions:
         return Image.new("RGB", (400, 300))
@@ -1492,16 +1499,22 @@ class AttentionTracker:
         for block in model.encoder.blocks:
             block.attn.output_attention = True
 
-        images = images.to(device)
+        images = images.to(device, non_blocking=True)
         _ = model.encoder(images)
 
-        attentions = model.encoder.get_attention_maps()
+        attentions = []
+        for a in model.encoder.get_attention_maps():
+            if a is None:
+                continue
+            attentions.append(a.detach().float().cpu())
 
         for block in model.encoder.blocks:
             block.attn.output_attention = False
+            if hasattr(block.attn, "attn_map"):
+                block.attn.attn_map = None
 
         # Store only first sample to save memory
-        attn_snapshot = [a[0:1].detach().cpu() for a in attentions]
+        attn_snapshot = [a[0:1] for a in attentions]
 
         self.snapshots.append((epoch, attn_snapshot))
 
