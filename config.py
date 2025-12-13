@@ -103,6 +103,10 @@ class Config:
 
     # Expensive diagnostics (epoch-level; can be slow)
     diagnostic_batch_size: int = 64
+    # Smaller batch for very heavy diagnostics (Hessian/landscapes/head ablation).
+    heavy_diagnostic_batch_size: int = 8
+    # Skip heavy diagnostics if CUDA free memory is below this threshold (MiB).
+    heavy_diag_min_free_mb: int = 1024
     gns_interval: int = 1
     gns_microbatches: int = 4
     sharpness_interval: int = 1

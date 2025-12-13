@@ -806,52 +806,60 @@ def _hessian_top_eig_power_iter(
     """
     Estimate top Hessian eigenvalue via power iteration on a parameter subset.
     """
-    named = _select_diag_params(model)
-    params = [p for _n, p in named]
-    if not params:
-        return {"sharpness/top_hessian_eig": 0.0}
+    with torch.enable_grad():
+        named = _select_diag_params(model)
+        params = [p for _n, p in named]
+        if not params:
+            return {"sharpness/top_hessian_eig": 0.0}
 
-    model.zero_grad(set_to_none=True)
-    probe.zero_grad(set_to_none=True)
+        model.zero_grad(set_to_none=True)
+        probe.zero_grad(set_to_none=True)
 
-    loss, _aux = _compute_training_loss_from_crops(
-        model, probe, loss_fn, crops, labels, device, mixed_precision
-    )
-
-    grads = torch.autograd.grad(loss, params, create_graph=True, retain_graph=True, allow_unused=True)
-    vec = [torch.randn_like(p, dtype=torch.float32) for p in params]
-
-    def _normalize(vs: list[torch.Tensor]) -> list[torch.Tensor]:
-        nrm = torch.sqrt(
-            sum([(v.detach().float().pow(2).sum()) for v in vs]) + 1e-12
+        loss, _aux = _compute_training_loss_from_crops(
+            model, probe, loss_fn, crops, labels, device, mixed_precision
         )
-        return [v / nrm for v in vs]
 
-    vec = _normalize(vec)
+        grads = torch.autograd.grad(
+            loss, params, create_graph=True, retain_graph=True, allow_unused=True
+        )
+        vec = [torch.randn_like(p, dtype=torch.float32) for p in params]
 
-    lam = 0.0
-    for _ in range(max(1, iters)):
-        dot = 0.0
-        for g, v in zip(grads, vec):
-            if g is None:
-                continue
-            dot = dot + (g.detach() * v).sum()
-        hv = torch.autograd.grad(dot, params, retain_graph=True, allow_unused=True)
-        hv = [torch.zeros_like(p, dtype=torch.float32) if h is None else h.detach().float() for p, h in zip(params, hv)]
+        def _normalize(vs: list[torch.Tensor]) -> list[torch.Tensor]:
+            nrm = torch.sqrt(
+                sum([(v.detach().float().pow(2).sum()) for v in vs]) + 1e-12
+            )
+            return [v / nrm for v in vs]
 
-        # Rayleigh quotient
-        num = 0.0
-        den = 0.0
-        for v, h in zip(vec, hv):
-            num = num + (v.detach().float() * h).sum()
-            den = den + (v.detach().float().pow(2).sum())
-        lam = (num / (den + 1e-12)).item()
-        vec = _normalize(hv)
+        vec = _normalize(vec)
 
-    return {
-        "sharpness/top_hessian_eig": float(lam),
-        "sharpness/params_tracked": float(len(params)),
-    }
+        lam = 0.0
+        for _ in range(max(1, iters)):
+            dot = 0.0
+            for g, v in zip(grads, vec):
+                if g is None:
+                    continue
+                dot = dot + (g.detach() * v).sum()
+            hv = torch.autograd.grad(dot, params, retain_graph=True, allow_unused=True)
+            hv = [
+                torch.zeros_like(p, dtype=torch.float32)
+                if h is None
+                else h.detach().float()
+                for p, h in zip(params, hv)
+            ]
+
+            # Rayleigh quotient
+            num = 0.0
+            den = 0.0
+            for v, h in zip(vec, hv):
+                num = num + (v.detach().float() * h).sum()
+                den = den + (v.detach().float().pow(2).sum())
+            lam = (num / (den + 1e-12)).item()
+            vec = _normalize(hv)
+
+        return {
+            "sharpness/top_hessian_eig": float(lam),
+            "sharpness/params_tracked": float(len(params)),
+        }
 
 
 def _loss_landscape_slice(
@@ -2267,8 +2275,26 @@ def main():
                 # 15. Expensive optimization diagnostics (can be slow)
                 if config.use_wandb and epoch % config.gns_interval == 0:
                     try:
+                        if device.type == "cuda":
+                            free_b, _total_b = torch.cuda.mem_get_info()
+                            free_mb = float(free_b) / (1024.0 * 1024.0)
+                            if free_mb < float(getattr(config, "heavy_diag_min_free_mb", 0)):
+                                wandb.log(
+                                    {
+                                        "sys/heavy_diag_skipped": 1.0,
+                                        "sys/cuda_free_mb": free_mb,
+                                    },
+                                    commit=False,
+                                )
+                                raise RuntimeError(
+                                    f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
+                                )
                         diag_crops, diag_labels = next(iter(train_loader))
-                        b = min(config.diagnostic_batch_size, diag_labels.shape[0])
+                        b = min(
+                            int(getattr(config, "heavy_diagnostic_batch_size", config.diagnostic_batch_size)),
+                            int(config.diagnostic_batch_size),
+                            int(diag_labels.shape[0]),
+                        )
                         diag_crops = [c[:b] for c in diag_crops]
                         diag_labels = diag_labels[:b]
                         with torch.enable_grad():
@@ -2288,8 +2314,26 @@ def main():
 
                 if config.use_wandb and epoch % config.sharpness_interval == 0:
                     try:
+                        if device.type == "cuda":
+                            free_b, _total_b = torch.cuda.mem_get_info()
+                            free_mb = float(free_b) / (1024.0 * 1024.0)
+                            if free_mb < float(getattr(config, "heavy_diag_min_free_mb", 0)):
+                                wandb.log(
+                                    {
+                                        "sys/heavy_diag_skipped": 1.0,
+                                        "sys/cuda_free_mb": free_mb,
+                                    },
+                                    commit=False,
+                                )
+                                raise RuntimeError(
+                                    f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
+                                )
                         diag_crops, diag_labels = next(iter(train_loader))
-                        b = min(config.diagnostic_batch_size, diag_labels.shape[0])
+                        b = min(
+                            int(getattr(config, "heavy_diagnostic_batch_size", config.diagnostic_batch_size)),
+                            int(config.diagnostic_batch_size),
+                            int(diag_labels.shape[0]),
+                        )
                         diag_crops = [c[:b] for c in diag_crops]
                         diag_labels = diag_labels[:b]
                         with torch.enable_grad():
@@ -2309,8 +2353,26 @@ def main():
 
                 if config.use_wandb and epoch % config.landscape_interval == 0:
                     try:
+                        if device.type == "cuda":
+                            free_b, _total_b = torch.cuda.mem_get_info()
+                            free_mb = float(free_b) / (1024.0 * 1024.0)
+                            if free_mb < float(getattr(config, "heavy_diag_min_free_mb", 0)):
+                                wandb.log(
+                                    {
+                                        "sys/heavy_diag_skipped": 1.0,
+                                        "sys/cuda_free_mb": free_mb,
+                                    },
+                                    commit=False,
+                                )
+                                raise RuntimeError(
+                                    f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
+                                )
                         diag_crops, diag_labels = next(iter(train_loader))
-                        b = min(config.diagnostic_batch_size, diag_labels.shape[0])
+                        b = min(
+                            int(getattr(config, "heavy_diagnostic_batch_size", config.diagnostic_batch_size)),
+                            int(config.diagnostic_batch_size),
+                            int(diag_labels.shape[0]),
+                        )
                         diag_crops = [c[:b] for c in diag_crops]
                         diag_labels = diag_labels[:b]
                         with torch.enable_grad():
@@ -2352,8 +2414,26 @@ def main():
 
                 if config.use_wandb and epoch % config.landscape2d_interval == 0:
                     try:
+                        if device.type == "cuda":
+                            free_b, _total_b = torch.cuda.mem_get_info()
+                            free_mb = float(free_b) / (1024.0 * 1024.0)
+                            if free_mb < float(getattr(config, "heavy_diag_min_free_mb", 0)):
+                                wandb.log(
+                                    {
+                                        "sys/heavy_diag_skipped": 1.0,
+                                        "sys/cuda_free_mb": free_mb,
+                                    },
+                                    commit=False,
+                                )
+                                raise RuntimeError(
+                                    f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
+                                )
                         diag_crops, diag_labels = next(iter(train_loader))
-                        b = min(config.diagnostic_batch_size, diag_labels.shape[0])
+                        b = min(
+                            int(getattr(config, "heavy_diagnostic_batch_size", config.diagnostic_batch_size)),
+                            int(config.diagnostic_batch_size),
+                            int(diag_labels.shape[0]),
+                        )
                         diag_crops = [c[:b] for c in diag_crops]
                         diag_labels = diag_labels[:b]
                         with torch.enable_grad():
@@ -2388,8 +2468,26 @@ def main():
 
                 if config.use_wandb and epoch % config.head_ablation_interval == 0:
                     try:
+                        if device.type == "cuda":
+                            free_b, _total_b = torch.cuda.mem_get_info()
+                            free_mb = float(free_b) / (1024.0 * 1024.0)
+                            if free_mb < float(getattr(config, "heavy_diag_min_free_mb", 0)):
+                                wandb.log(
+                                    {
+                                        "sys/heavy_diag_skipped": 1.0,
+                                        "sys/cuda_free_mb": free_mb,
+                                    },
+                                    commit=False,
+                                )
+                                raise RuntimeError(
+                                    f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
+                                )
                         diag_crops, diag_labels = next(iter(train_loader))
-                        b = min(config.diagnostic_batch_size, diag_labels.shape[0])
+                        b = min(
+                            int(getattr(config, "heavy_diagnostic_batch_size", config.diagnostic_batch_size)),
+                            int(config.diagnostic_batch_size),
+                            int(diag_labels.shape[0]),
+                        )
                         diag_crops = [c[:b] for c in diag_crops]
                         diag_labels = diag_labels[:b]
                         ab = _head_ablation_sensitivity(
