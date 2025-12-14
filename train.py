@@ -23,6 +23,7 @@ import copy
 import time
 from contextlib import nullcontext
 from pathlib import Path
+import os
 
 import torch
 import torch.nn as nn
@@ -1169,6 +1170,10 @@ def main():
     parser.add_argument("--use_wandb", action="store_true", default=None)
     parser.add_argument("--no_wandb", action="store_true")
     parser.add_argument("--wandb_project", type=str, default=None)
+    parser.add_argument("--wandb_entity", type=str, default=None)
+    parser.add_argument(
+        "--wandb_mode", type=str, choices=["online", "offline", "disabled"], default=None
+    )
     parser.add_argument("--attn_distance_headmap_interval", type=int, default=None)
     parser.add_argument("--attn_logits_interval", type=int, default=None)
     parser.add_argument("--mlp_output_stats_interval", type=int, default=None)
@@ -1213,28 +1218,44 @@ def main():
         try:
             import wandb
 
-            try:
-                wandb.init(
-                    project=config.wandb_project,
-                    config=vars(config),
-                    name=f"{config.encoder}-{time.strftime('%Y%m%d_%H%M%S')}",
-                )
-            except Exception as e:
-                # Common failure modes: invalid/expired API key, missing permissions (403),
-                # or networking/proxy issues. Prefer continuing training with offline logs.
-                print(f"wandb init failed ({type(e).__name__}: {e}). Falling back to offline mode.")
+            if config.wandb_mode == "disabled":
+                config.use_wandb = False
+            if os.environ.get("WANDB_DISABLED", "").lower() in {"1", "true", "yes"}:
+                config.use_wandb = False
+
+            # Prefer explicit entity (CLI/config), otherwise fall back to env.
+            if not config.wandb_entity:
+                env_entity = os.environ.get("WANDB_ENTITY")
+                if env_entity:
+                    config.wandb_entity = env_entity
+
+            run_name = f"{config.encoder}-{time.strftime('%Y%m%d_%H%M%S')}"
+            init_kwargs = {
+                "project": config.wandb_project,
+                "config": vars(config),
+                "name": run_name,
+            }
+            if config.wandb_entity:
+                init_kwargs["entity"] = config.wandb_entity
+
+            if config.use_wandb:
                 try:
-                    wandb.init(
-                        project=config.wandb_project,
-                        config=vars(config),
-                        name=f"{config.encoder}-{time.strftime('%Y%m%d_%H%M%S')}",
-                        mode="offline",
+                    if config.wandb_mode == "offline":
+                        wandb.init(**init_kwargs, mode="offline")
+                    else:
+                        wandb.init(**init_kwargs)
+                except Exception as e:
+                    msg = (
+                        "wandb.init failed. This is usually due to an invalid/expired API key "
+                        "or missing permissions to write to the selected entity/project.\n"
+                        f"  entity={init_kwargs.get('entity', '<default>')}\n"
+                        f"  project={init_kwargs.get('project')}\n"
+                        "Fix:\n"
+                        "  - Run `wandb login --relogin` with a key that has access, OR\n"
+                        "  - Pass the correct entity via `--wandb_entity <your_entity>`.\n"
+                        "If you want to proceed without logging, add `--no_wandb`."
                     )
-                except Exception as e2:
-                    print(
-                        f"wandb offline init failed ({type(e2).__name__}: {e2}). Disabling wandb logging."
-                    )
-                    config.use_wandb = False
+                    raise RuntimeError(msg) from e
 
             if config.use_wandb:
                 # Define x-axes for different metric types

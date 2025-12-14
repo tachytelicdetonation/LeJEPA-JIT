@@ -81,6 +81,8 @@ class Config:
     save_interval: int = 10
     output_dir: str = "outputs"
     wandb_project: str = "lejepa-jit"
+    wandb_entity: str | None = None
+    wandb_mode: Literal["online", "offline", "disabled"] = "online"
     use_wandb: bool = True
 
     # =============================================================================
