@@ -21,6 +21,7 @@ from utils.visualization import (
     # Original visualizations
     generate_attention_grid,
     generate_attention_rollout,
+    generate_attention_entropy_per_head_heatmap,
     generate_pca_visualization,
     # New: Layer-wise attention
     generate_layer_attention_evolution,
@@ -38,6 +39,7 @@ from utils.visualization import (
     generate_gradient_flow_heatmap,
     # New: Embedding projection (t-SNE/UMAP)
     generate_embedding_projection,
+    generate_embedding_pca_scatter,
     # New: Attention tracking
     AttentionTracker,
     # New: Collapse monitor
@@ -68,6 +70,7 @@ __all__ = [
     "generate_pca_visualization",
     "generate_attention_rollout",
     "generate_attention_grid",
+    "generate_attention_entropy_per_head_heatmap",
     # New Visualizations - Training Dynamics
     "generate_layer_attention_evolution",
     "generate_per_head_attention",
@@ -77,6 +80,7 @@ __all__ = [
     "generate_rsm_across_layers",
     "generate_gradient_flow_heatmap",
     "generate_embedding_projection",
+    "generate_embedding_pca_scatter",
     "generate_collapse_monitor",
     "generate_training_dashboard",
     "generate_embedding_spectrum",

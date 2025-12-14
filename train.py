@@ -1315,24 +1315,22 @@ def main():
 
     # Import visualization utils
     from utils.visualization import (
+        generate_attention_entropy_per_head_heatmap_from_maps,
         generate_pca_visualization,
         generate_attention_rollout,
-        generate_attention_grid,
         generate_layer_attention_evolution,
         generate_per_head_attention,
-        generate_head_importance_heatmap,
-        generate_attention_distance_per_head_heatmap,
+        generate_attention_distance_per_head_heatmap_from_maps,
         generate_token_similarity_heatmap,
         generate_rsm_across_layers,
         generate_gradient_flow_heatmap,
+        generate_embedding_pca_scatter,
         generate_embedding_projection,
         generate_collapse_monitor,
-        generate_embedding_spectrum,
         generate_layerwise_curves,
         generate_loss_landscape_slice,
         generate_loss_landscape_2d,
         generate_head_ablation_heatmap,
-        generate_training_dashboard,
         AttentionTracker,
     )
 
@@ -1348,19 +1346,24 @@ def main():
         blk.attn.attn_drop.register_full_backward_hook(lambda m, i, o: grad_hook(o[0]))
 
     # Initialize attention tracker for epoch-to-epoch comparison
-    attn_tracker = AttentionTracker(max_snapshots=10)
-
-    # History lists for training dashboard
-    loss_history = []
-    acc_history = []
-    entropy_history = []
-    gini_history = []
-    lr_history = []
+    attn_tracker = (
+        AttentionTracker(max_snapshots=10)
+        if int(getattr(config, "attention_difference_interval", 0)) > 0
+        else None
+    )
 
     prev_rep_nette = None
     prev_rep_woof = None
     prev_block_reps_nette = None
     prev_block_reps_woof = None
+
+    def _every(ep: int, interval: int) -> bool:
+        """Return True if a diagnostic should run this epoch (interval<=0 disables)."""
+        return int(interval) > 0 and (ep % int(interval) == 0)
+
+    def _every_or_first(ep: int, interval: int) -> bool:
+        """Like _every(), but always run on epoch 1 if enabled (interval>0)."""
+        return int(interval) > 0 and (ep == 1 or ep % int(interval) == 0)
 
     for epoch in range(1, config.epochs + 1):
         start_time = time.time()
@@ -1423,7 +1426,7 @@ def main():
         knn_metrics_woof = {}
         lid_metrics_nette = {}
         lid_metrics_woof = {}
-        if config.use_wandb and epoch % config.knn_interval == 0:
+        if config.use_wandb and _every_or_first(epoch, config.knn_interval):
             print("kNN eval on ImageNette embeddings...")
             knn_metrics_nette = evaluate_knn(
                 model,
@@ -1447,7 +1450,7 @@ def main():
                 mixed_precision=config.mixed_precision,
             )
 
-        if config.use_wandb and epoch % config.lid_interval == 0:
+        if config.use_wandb and _every_or_first(epoch, config.lid_interval):
             print("Intrinsic dimension (TwoNN) on ImageNette embeddings...")
             lid_metrics_nette = evaluate_intrinsic_dim(
                 model,
@@ -1508,13 +1511,6 @@ def main():
                 }
             )
 
-        # Update history for dashboard
-        loss_history.append(train_metrics["loss"])
-        acc_history.append(
-            val_metrics_nette.get("val_accuracy", train_metrics["accuracy"])
-        )
-        lr_history.append(scheduler.get_last_lr()[0])
-
         # Generate Visualizations
         if vis_images_nette is not None or vis_images_woof is not None:
             try:
@@ -1543,9 +1539,9 @@ def main():
                         commit=False,
                     )
 
-                # === Original Visualizations ===
-                # 1. ImageNette Vis
-                if vis_images_nette is not None:
+                # === Core qualitative visuals (interval-gated) ===
+                # 1. ImageNette: Patch PCA visualization
+                if vis_images_nette is not None and _every_or_first(epoch, config.pca_vis_interval):
                     vis_grid_nette = generate_pca_visualization(
                         model,
                         vis_images_nette,
@@ -1559,16 +1555,17 @@ def main():
                     if config.use_wandb:
                         wandb.log(
                             {
-                                "pca_vis_nette": wandb.Image(
-                                    vis_grid_nette, caption=f"Epoch {epoch} (Nette)"
+                                "vis/nette_patch_pca": wandb.Image(
+                                    vis_grid_nette, caption=f"Epoch {epoch}"
                                 )
                             },
                             commit=False,
                         )
-                        if len(vis_frames_nette) > 1:
+                        if _every(epoch, getattr(config, "pca_gif_interval", 0)) and len(vis_frames_nette) > 1:
                             log_gif(vis_frames_nette, "pca_progression_nette", "nette")
 
-                    # Attention Rollout
+                # 2. ImageNette: Attention rollout overlay
+                if vis_images_nette is not None and _every_or_first(epoch, config.attn_rollout_interval):
                     attn_grid_nette = generate_attention_rollout(
                         model,
                         vis_images_nette,
@@ -1580,41 +1577,17 @@ def main():
                     if config.use_wandb:
                         wandb.log(
                             {
-                                "attn_vis_nette": wandb.Image(
-                                    attn_grid_nette,
-                                    caption=f"Epoch {epoch} (Nette Attn)",
+                                "vis/nette_attn_rollout": wandb.Image(
+                                    attn_grid_nette, caption=f"Epoch {epoch}"
                                 )
                             },
                             commit=False,
                         )
-                        if len(attn_frames_nette) > 1:
-                            log_gif(
-                                attn_frames_nette,
-                                "attn_progression_nette",
-                                "attn_nette",
-                            )
-
-                    # Attention Grid (Raw)
-                    grid_raw_nette = generate_attention_grid(
-                        model,
-                        vis_images_nette,
-                        device,
-                        img_size=config.img_size,
-                        patch_size=config.patch_size,
-                    )
-                    if config.use_wandb:
-                        wandb.log(
-                            {
-                                "attn_grid_nette": wandb.Image(
-                                    grid_raw_nette,
-                                    caption=f"Epoch {epoch} (Nette Grid)",
-                                )
-                            },
-                            commit=False,
-                        )
+                        if _every(epoch, getattr(config, "attn_gif_interval", 0)) and len(attn_frames_nette) > 1:
+                            log_gif(attn_frames_nette, "attn_progression_nette", "attn_nette")
 
                 # 2. ImageWoof Vis
-                if vis_images_woof is not None:
+                if vis_images_woof is not None and _every_or_first(epoch, config.pca_vis_interval):
                     vis_grid_woof = generate_pca_visualization(
                         model,
                         vis_images_woof,
@@ -1627,17 +1600,13 @@ def main():
                     vis_frames_woof.append(vis_grid_woof)
                     if config.use_wandb:
                         wandb.log(
-                            {
-                                "pca_vis_woof": wandb.Image(
-                                    vis_grid_woof, caption=f"Epoch {epoch} (Woof)"
-                                )
-                            },
+                            {"vis/woof_patch_pca": wandb.Image(vis_grid_woof, caption=f"Epoch {epoch}")},
                             commit=False,
                         )
-                        if len(vis_frames_woof) > 1:
+                        if _every(epoch, getattr(config, "pca_gif_interval", 0)) and len(vis_frames_woof) > 1:
                             log_gif(vis_frames_woof, "pca_progression_woof", "woof")
 
-                    # Attention Rollout
+                if vis_images_woof is not None and _every_or_first(epoch, config.attn_rollout_interval):
                     attn_grid_woof = generate_attention_rollout(
                         model,
                         vis_images_woof,
@@ -1648,35 +1617,11 @@ def main():
                     attn_frames_woof.append(attn_grid_woof)
                     if config.use_wandb:
                         wandb.log(
-                            {
-                                "attn_vis_woof": wandb.Image(
-                                    attn_grid_woof, caption=f"Epoch {epoch} (Woof Attn)"
-                                )
-                            },
+                            {"vis/woof_attn_rollout": wandb.Image(attn_grid_woof, caption=f"Epoch {epoch}")},
                             commit=False,
                         )
-                        if len(attn_frames_woof) > 1:
-                            log_gif(
-                                attn_frames_woof, "attn_progression_woof", "attn_woof"
-                            )
-
-                    # Attention Grid (Raw)
-                    grid_raw_woof = generate_attention_grid(
-                        model,
-                        vis_images_woof,
-                        device,
-                        img_size=config.img_size,
-                        patch_size=config.patch_size,
-                    )
-                    if config.use_wandb:
-                        wandb.log(
-                            {
-                                "attn_grid_woof": wandb.Image(
-                                    grid_raw_woof, caption=f"Epoch {epoch} (Woof Grid)"
-                                )
-                            },
-                            commit=False,
-                        )
+                        if _every(epoch, getattr(config, "attn_gif_interval", 0)) and len(attn_frames_woof) > 1:
+                            log_gif(attn_frames_woof, "attn_progression_woof", "attn_woof")
 
                 # === NEW VISUALIZATIONS: Training & Attention Dynamics ===
                 vis_images = (
@@ -1685,8 +1630,8 @@ def main():
                     else vis_images_woof
                 )
 
-                # 3. Layer-wise Attention Evolution (every 5 epochs)
-                if epoch % config.layer_attention_interval == 0:
+                # 3. Layer-wise Attention Evolution
+                if _every_or_first(epoch, config.layer_attention_interval):
                     layer_attn_vis = generate_layer_attention_evolution(
                         model,
                         vis_images,
@@ -1697,15 +1642,15 @@ def main():
                     if config.use_wandb:
                         wandb.log(
                             {
-                                "layer_attention_evolution": wandb.Image(
+                                "vis/layer_attention_evolution": wandb.Image(
                                     layer_attn_vis, caption=f"Epoch {epoch}"
                                 )
                             },
                             commit=False,
                         )
 
-                # 4. Per-Head Attention (every 10 epochs)
-                if epoch % config.per_head_attention_interval == 0:
+                # 4. Per-Head Attention
+                if _every_or_first(epoch, config.per_head_attention_interval):
                     per_head_vis = generate_per_head_attention(
                         model,
                         vis_images,
@@ -1717,76 +1662,80 @@ def main():
                     if config.use_wandb:
                         wandb.log(
                             {
-                                "per_head_attention": wandb.Image(
+                                "vis/per_head_attention": wandb.Image(
                                     per_head_vis, caption=f"Epoch {epoch} Last Layer"
                                 )
                             },
                             commit=False,
                         )
 
-                # 5. Head Importance Heatmap (every 10 epochs)
-                if epoch % config.head_importance_interval == 0:
-                    head_importance_vis = generate_head_importance_heatmap(
-                        model, vis_images, device
-                    )
-                    if config.use_wandb:
-                        wandb.log(
-                            {
-                                "head_importance": wandb.Image(
-                                    head_importance_vis, caption=f"Epoch {epoch}"
-                                )
-                            },
-                            commit=False,
-                        )
-
-                # 6. Token Similarity Heatmap (every 10 epochs)
-                if epoch % config.token_similarity_interval == 0:
+                # 5. Token Similarity Heatmap
+                if _every_or_first(epoch, config.token_similarity_interval):
                     token_sim_vis = generate_token_similarity_heatmap(
                         model, vis_images, device, sample_idx=0
                     )
                     if config.use_wandb:
                         wandb.log(
                             {
-                                "token_similarity": wandb.Image(
+                                "vis/token_similarity": wandb.Image(
                                     token_sim_vis, caption=f"Epoch {epoch}"
                                 )
                             },
                             commit=False,
                         )
 
-                # 7. RSM Across Layers (every 10 epochs)
-                if epoch % config.rsm_interval == 0:
+                # 6. RSM Across Layers
+                if _every_or_first(epoch, config.rsm_interval):
                     rsm_vis = generate_rsm_across_layers(model, vis_images, device)
                     if config.use_wandb:
                         wandb.log(
                             {
-                                "rsm_layers": wandb.Image(
+                                "vis/rsm_layers": wandb.Image(
                                     rsm_vis, caption=f"Epoch {epoch}"
                                 )
                             },
                             commit=False,
                         )
 
-                # 8. Capture Attention for Difference Tracking
-                attn_tracker.capture(model, vis_images, device, epoch)
+                # 7. Attention Difference Tracking (optional; assumes CLS and can be noisy)
+                if attn_tracker is not None and _every_or_first(
+                    epoch, getattr(config, "attention_difference_interval", 0)
+                ):
+                    attn_tracker.capture(model, vis_images, device, epoch)
+                    if epoch > 1:
+                        attn_diff_vis = attn_tracker.generate_difference_visualization(
+                            img_size=config.img_size, patch_size=config.patch_size
+                        )
+                        if attn_diff_vis is not None and config.use_wandb:
+                            wandb.log(
+                                {
+                                    "vis/attention_difference": wandb.Image(
+                                        attn_diff_vis, caption=f"Epoch 1 → {epoch}"
+                                    )
+                                },
+                                commit=False,
+                            )
 
-                # 9. Attention Difference Visualization (after epoch 2)
-                if epoch > 1:
-                    attn_diff_vis = attn_tracker.generate_difference_visualization(
-                        img_size=config.img_size, patch_size=config.patch_size
-                    )
-                    if attn_diff_vis is not None and config.use_wandb:
+                # 8. Embedding PCA scatter (stable qualitative benchmark)
+                if config.use_wandb and _every_or_first(epoch, getattr(config, "embedding_pca_scatter_interval", 0)):
+                    try:
+                        pca_scatter = generate_embedding_pca_scatter(
+                            model,
+                            val_loader_nette,
+                            device,
+                            max_samples=400,
+                            view_idx=0,
+                            use_last_layer_only=True,
+                        )
                         wandb.log(
-                            {
-                                "attention_difference": wandb.Image(
-                                    attn_diff_vis, caption=f"Epoch 1 → {epoch}"
-                                )
-                            },
+                            {"vis/embedding_pca_scatter_nette": wandb.Image(pca_scatter, caption=f"Epoch {epoch}")},
                             commit=False,
                         )
+                    except Exception as e:
+                        print(f"Embedding PCA scatter failed: {e}")
 
                 # 9b. Representation drift (lightweight): cosine + linear CKA
-                if epoch % config.drift_interval == 0 and config.use_wandb:
+                if config.use_wandb and _every_or_first(epoch, config.drift_interval):
                     import wandb
 
                     def _drift_metrics(tag: str, prev: torch.Tensor, cur: torch.Tensor) -> dict:
@@ -1831,49 +1780,46 @@ def main():
                         )
                         prev_rep_woof = cur_rep_woof.detach()
 
-                # 10. Feature Collapse Monitor (every 5 epochs)
-                if epoch % config.collapse_monitor_interval == 0:
+                # 10. Representation / collapse monitoring (fixed batch)
+                if _every_or_first(epoch, config.collapse_monitor_interval):
                     with torch.no_grad():
                         emb_sample, _ = model(vis_images.unsqueeze(1))
-                    collapse_vis = generate_collapse_monitor(emb_sample)
-                    spectrum_vis = generate_embedding_spectrum(emb_sample)
+
                     if config.use_wandb:
+                        collapse_vis = generate_collapse_monitor(emb_sample)
                         wandb.log(
                             {
-                                "collapse_monitor": wandb.Image(
+                                "vis/collapse_monitor": wandb.Image(
                                     collapse_vis, caption=f"Epoch {epoch}"
                                 )
                             },
                             commit=False,
                         )
+
+                        # Scalar collapse + representation diagnostics (benchmark-friendly)
+                        collapse_metrics = compute_feature_collapse_metrics(emb_sample)
+                        rep_stats = compute_representation_stats(emb_sample)
+                        cov_stats = compute_covariance_metrics(emb_sample)
                         wandb.log(
                             {
-                                "epoch_rep/embedding_spectrum": wandb.Image(
-                                    spectrum_vis, caption=f"Epoch {epoch}"
-                                )
+                                "collapse/avg_similarity": collapse_metrics["avg_similarity"],
+                                "collapse/std": collapse_metrics["std"],
+                                "collapse/effective_rank": collapse_metrics["effective_rank"],
+                                "collapse/uniformity": collapse_metrics["uniformity"],
+                                "rep/norm_mean": rep_stats.get("norm_mean", 0.0),
+                                "rep/norm_std": rep_stats.get("norm_std", 0.0),
+                                "rep/variance": rep_stats.get("variance", 0.0),
+                                "rep/effective_dim": rep_stats.get("effective_dim", 0.0),
+                                "rep/isotropy": rep_stats.get("isotropy", 0.0),
+                                "rep/cov_offdiag_l2": cov_stats.get("cov_offdiag_l2", 0.0),
+                                "rep/var_mean": cov_stats.get("var_mean", 0.0),
+                                "rep/var_min": cov_stats.get("var_min", 0.0),
                             },
                             commit=False,
                         )
 
-                    # Also compute and log collapse metrics
-                    collapse_metrics = compute_feature_collapse_metrics(emb_sample)
-                    if config.use_wandb:
-                        wandb.log(
-                            {
-                                "collapse/avg_similarity": collapse_metrics[
-                                    "avg_similarity"
-                                ],
-                                "collapse/std": collapse_metrics["std"],
-                                "collapse/effective_rank": collapse_metrics[
-                                    "effective_rank"
-                                ],
-                                "collapse/uniformity": collapse_metrics["uniformity"],
-                            },
-                                commit=False,
-                            )
-
                 # 10b. Block-wise activation diagnostics (token norms + residual ratios + drift)
-                if epoch % config.block_diag_interval == 0 and config.use_wandb:
+                if config.use_wandb and _every_or_first(epoch, config.block_diag_interval):
                     import wandb
 
                     def _collect_block_stats(images: torch.Tensor) -> tuple[dict, list]:
@@ -1977,58 +1923,59 @@ def main():
                             "woof", vis_images_woof, prev_block_reps_woof
                         )
 
-                # 11. Gradient Flow Heatmap (every 5 epochs, after backward)
-                if epoch % config.gradient_flow_interval == 0:
+                # 11. Gradient Flow Heatmap
+                if config.use_wandb and _every_or_first(epoch, config.gradient_flow_interval):
                     grad_stats = compute_layer_gradient_stats(model)
                     grad_flow_vis = generate_gradient_flow_heatmap(grad_stats)
-                    if config.use_wandb:
+                    wandb.log(
+                        {"vis/gradient_flow": wandb.Image(grad_flow_vis, caption=f"Epoch {epoch}")},
+                        commit=False,
+                    )
+
+                # 12. Transformer attention diagnostics (fixed batch; interval-gated)
+                need_attn = config.use_wandb and (
+                    _every_or_first(epoch, config.transformer_diag_interval)
+                    or _every_or_first(epoch, config.attn_distance_headmap_interval)
+                    or _every_or_first(epoch, getattr(config, "attn_entropy_headmap_interval", 0))
+                )
+                if need_attn:
+                    with torch.no_grad():
+                        for blk in model.encoder.blocks:
+                            blk.attn.output_attention = True
+                        _ = model.encoder(vis_images)
+                        attns = model.encoder.get_attention_maps()
+                        for blk in model.encoder.blocks:
+                            blk.attn.output_attention = False
+                            if hasattr(blk.attn, "attn_map"):
+                                blk.attn.attn_map = None
+
+                    if attns:
+                        last_attn = attns[-1]
                         wandb.log(
                             {
-                                "gradient_flow": wandb.Image(
-                                    grad_flow_vis, caption=f"Epoch {epoch}"
-                                )
+                                "epoch_attn/entropy": float(compute_entropy(last_attn).item()),
+                                "epoch_attn/gini": float(compute_gini(last_attn).item()),
+                                "epoch_attn/sparsity": float(compute_sparsity(last_attn).item()),
                             },
                             commit=False,
                         )
 
-                # 12. Compute and log attention entropy/gini for history
-                with torch.no_grad():
-                    for blk in model.encoder.blocks:
-                        blk.attn.output_attention = True
-                    _ = model.encoder(vis_images)
-                    attns = model.encoder.get_attention_maps()
-                    for blk in model.encoder.blocks:
-                        blk.attn.output_attention = False
-                    if attns:
-                        last_attn = attns[-1]
-                        entropy_history.append(compute_entropy(last_attn).item())
-                        gini_history.append(compute_gini(last_attn).item())
-
-                        # Log head diversity metrics
                         head_div = compute_head_diversity(last_attn)
-                        if config.use_wandb:
-                            wandb.log(
-                                {
-                                    "attention/head_similarity": head_div[
-                                        "head_similarity"
-                                    ],
-                                    "attention/head_variance": head_div[
-                                        "head_variance"
-                                    ],
-                                    "attention/effective_heads": head_div[
-                                        "effective_heads"
-                                    ],
-                                },
-                                commit=False,
-                            )
+                        wandb.log(
+                            {
+                                "epoch_attn/head_similarity": head_div.get("head_similarity", 0.0),
+                                "epoch_attn/head_variance": head_div.get("head_variance", 0.0),
+                                "epoch_attn/effective_heads": head_div.get("effective_heads", 0.0),
+                            },
+                            commit=False,
+                        )
 
-                        # Per-layer attention sink + diagonal diagnostics (epoch-level on fixed batch)
-                        if epoch % config.transformer_diag_interval == 0:
+                        # Per-layer attention structure + distance trends
+                        if _every_or_first(epoch, config.transformer_diag_interval):
                             layer_p2c = []
                             layer_c2p = []
                             layer_diag = []
                             layer_head_ent = []
-                            layer_head_ent_std = []
                             layer_attn_dist = []
                             layer_local_r1 = []
                             eps = 1e-8
@@ -2042,7 +1989,6 @@ def main():
 
                                 head_ent = -(a * torch.log(a + eps)).sum(dim=-1).mean(dim=-1)  # (B,H)
                                 layer_head_ent.append(head_ent.mean().item())
-                                layer_head_ent_std.append(head_ent.std(dim=1).mean().item())
 
                                 epoch_attn_layer[f"epoch_attn_layer/patches_to_cls/l{li}"] = m.get(
                                     "patches_to_cls", 0.0
@@ -2054,81 +2000,65 @@ def main():
                                     "diag_mass", 0.0
                                 )
                                 epoch_attn_layer[f"epoch_attn_layer/head_entropy_mean/l{li}"] = head_ent.mean().item()
-                                epoch_attn_layer[f"epoch_attn_layer/head_entropy_std/l{li}"] = head_ent.std(dim=1).mean().item()
 
                                 d = compute_attention_distance_metrics(
                                     a, grid_size=config.img_size // config.patch_size, radius=1
                                 )
                                 layer_attn_dist.append(d.get("patch_attn_distance_mean", 0.0))
                                 layer_local_r1.append(d.get("patch_local_mass_r1", 0.0))
-                                epoch_attn_layer[
-                                    f"epoch_attn_layer/patch_attn_distance_mean/l{li}"
-                                ] = d.get("patch_attn_distance_mean", 0.0)
-                                epoch_attn_layer[
-                                    f"epoch_attn_layer/patch_local_mass_r1/l{li}"
-                                ] = d.get("patch_local_mass_r1", 0.0)
-
-                            if config.use_wandb:
-                                wandb.log(epoch_attn_layer, commit=False)
-                                attn_plot = generate_layerwise_curves(
-                                    {
-                                        "patches→CLS": layer_p2c,
-                                        "CLS→patches": layer_c2p,
-                                        "diag_mass": layer_diag,
-                                        "head_entropy_mean": layer_head_ent,
-                                    },
-                                    title=f"Transformer Attention Diagnostics (Epoch {epoch})",
-                                    ylabel="value",
+                                epoch_attn_layer[f"epoch_attn_layer/patch_attn_distance_mean/l{li}"] = d.get(
+                                    "patch_attn_distance_mean", 0.0
                                 )
-                                wandb.log(
-                                    {
-                                        "epoch_attn_layer/diagnostics_plot": wandb.Image(
-                                            attn_plot, caption=f"Epoch {epoch}"
-                                        )
-                                    },
-                                    commit=False,
+                                epoch_attn_layer[f"epoch_attn_layer/patch_local_mass_r1/l{li}"] = d.get(
+                                    "patch_local_mass_r1", 0.0
                                 )
 
-                                dist_plot = generate_layerwise_curves(
-                                    {
-                                        "attn_distance_mean": layer_attn_dist,
-                                        "local_mass_r1": layer_local_r1,
-                                    },
-                                    title=f"Attention Distance/Locality (Epoch {epoch})",
-                                    ylabel="value",
-                                )
-                                wandb.log(
-                                    {
-                                        "epoch_attn_layer/distance_plot": wandb.Image(
-                                            dist_plot, caption=f"Epoch {epoch}"
-                                        )
-                                    },
-                                    commit=False,
-                                )
+                            wandb.log(epoch_attn_layer, commit=False)
 
-                        # Head×layer attention distance/locality heatmap
-                        if (
-                            config.use_wandb
-                            and epoch % config.attn_distance_headmap_interval == 0
-                        ):
-                            dist_head = generate_attention_distance_per_head_heatmap(
-                                model,
-                                vis_images,
-                                device,
-                                grid_size=config.img_size // config.patch_size,
-                                radius=1,
+                            attn_plot = generate_layerwise_curves(
+                                {
+                                    "patches→CLS": layer_p2c,
+                                    "CLS→patches": layer_c2p,
+                                    "diag_mass": layer_diag,
+                                    "head_entropy_mean": layer_head_ent,
+                                },
+                                title=f"Transformer Attention Diagnostics (Epoch {epoch})",
+                                ylabel="value",
                             )
                             wandb.log(
-                                {
-                                    "epoch_attn_layer/attn_distance_per_head": wandb.Image(
-                                        dist_head, caption=f"Epoch {epoch}"
-                                    )
-                                },
+                                {"vis/attn_layer_diagnostics": wandb.Image(attn_plot, caption=f"Epoch {epoch}")},
+                                commit=False,
+                            )
+
+                            dist_plot = generate_layerwise_curves(
+                                {"attn_distance_mean": layer_attn_dist, "local_mass_r1": layer_local_r1},
+                                title=f"Attention Distance/Locality (Epoch {epoch})",
+                                ylabel="value",
+                            )
+                            wandb.log(
+                                {"vis/attn_layer_distance": wandb.Image(dist_plot, caption=f"Epoch {epoch}")},
+                                commit=False,
+                            )
+
+                        # Head×layer heatmaps (reuse computed maps; avoid extra forward)
+                        if _every_or_first(epoch, config.attn_distance_headmap_interval):
+                            dist_head = generate_attention_distance_per_head_heatmap_from_maps(
+                                attns, grid_size=config.img_size // config.patch_size, radius=1
+                            )
+                            wandb.log(
+                                {"vis/attn_distance_per_head": wandb.Image(dist_head, caption=f"Epoch {epoch}")},
+                                commit=False,
+                            )
+
+                        if _every_or_first(epoch, getattr(config, "attn_entropy_headmap_interval", 0)):
+                            ent_head = generate_attention_entropy_per_head_heatmap_from_maps(attns)
+                            wandb.log(
+                                {"vis/attn_entropy_per_head": wandb.Image(ent_head, caption=f"Epoch {epoch}")},
                                 commit=False,
                             )
 
                 # 12b. Attention logit stats (pre-softmax QK^T) per layer
-                if config.use_wandb and epoch % config.attn_logits_interval == 0:
+                if config.use_wandb and _every_or_first(epoch, config.attn_logits_interval):
                     import wandb
 
                     for blk in model.encoder.blocks:
@@ -2179,7 +2109,7 @@ def main():
                     )
 
                 # 12c. MLP output stats per layer (outliers/saturation proxy)
-                if config.use_wandb and epoch % config.mlp_output_stats_interval == 0:
+                if config.use_wandb and _every_or_first(epoch, config.mlp_output_stats_interval):
                     import wandb
 
                     mlp_metrics = {}
@@ -2234,27 +2164,8 @@ def main():
                         commit=False,
                     )
 
-                # 13. Training Dashboard (every 10 epochs)
-                if epoch % config.training_dashboard_interval == 0 and len(loss_history) > 1:
-                    dashboard = generate_training_dashboard(
-                        loss_history,
-                        acc_history,
-                        entropy_history,
-                        gini_history,
-                        lr_history,
-                    )
-                    if config.use_wandb:
-                        wandb.log(
-                            {
-                                "training_dashboard": wandb.Image(
-                                    dashboard, caption=f"Epoch {epoch}"
-                                )
-                            },
-                                commit=False,
-                            )
-
-                # 14. t-SNE Embedding Projection (every 20 epochs - expensive)
-                if epoch % config.embedding_projection_interval == 0:
+                # 14. t-SNE/UMAP Embedding Projection (optional; expensive)
+                if config.use_wandb and _every_or_first(epoch, config.embedding_projection_interval):
                     try:
                         tsne_vis = generate_embedding_projection(
                             model,
@@ -2263,20 +2174,15 @@ def main():
                             method="tsne",
                             max_samples=300,
                         )
-                        if config.use_wandb:
-                            wandb.log(
-                                {
-                                    "embedding_tsne": wandb.Image(
-                                        tsne_vis, caption=f"Epoch {epoch}"
-                                    )
-                                },
-                                commit=False,
-                            )
+                        wandb.log(
+                            {"vis/embedding_tsne": wandb.Image(tsne_vis, caption=f"Epoch {epoch}")},
+                            commit=False,
+                        )
                     except Exception as e:
                         print(f"t-SNE visualization failed: {e}")
 
                 # 15. Expensive optimization diagnostics (can be slow)
-                if config.use_wandb and epoch % config.gns_interval == 0:
+                if config.use_wandb and _every_or_first(epoch, config.gns_interval):
                     try:
                         if device.type == "cuda":
                             free_b, _total_b = torch.cuda.mem_get_info()
@@ -2315,7 +2221,7 @@ def main():
                     except Exception as e:
                         print(f"GNS diagnostics failed: {e}")
 
-                if config.use_wandb and epoch % config.sharpness_interval == 0:
+                if config.use_wandb and _every_or_first(epoch, config.sharpness_interval):
                     try:
                         if device.type == "cuda":
                             free_b, _total_b = torch.cuda.mem_get_info()
@@ -2354,7 +2260,7 @@ def main():
                     except Exception as e:
                         print(f"Sharpness diagnostics failed: {e}")
 
-                if config.use_wandb and epoch % config.landscape_interval == 0:
+                if config.use_wandb and _every_or_first(epoch, config.landscape_interval):
                     try:
                         if device.type == "cuda":
                             free_b, _total_b = torch.cuda.mem_get_info()
@@ -2415,7 +2321,7 @@ def main():
                     except Exception as e:
                         print(f"Loss landscape diagnostics failed: {e}")
 
-                if config.use_wandb and epoch % config.landscape2d_interval == 0:
+                if config.use_wandb and _every_or_first(epoch, config.landscape2d_interval):
                     try:
                         if device.type == "cuda":
                             free_b, _total_b = torch.cuda.mem_get_info()
@@ -2469,7 +2375,7 @@ def main():
                     except Exception as e:
                         print(f"2D loss landscape diagnostics failed: {e}")
 
-                if config.use_wandb and epoch % config.head_ablation_interval == 0:
+                if config.use_wandb and _every_or_first(epoch, config.head_ablation_interval):
                     try:
                         if device.type == "cuda":
                             free_b, _total_b = torch.cuda.mem_get_info()

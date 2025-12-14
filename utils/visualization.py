@@ -188,6 +188,96 @@ def generate_loss_landscape_2d(
 
 
 @torch.no_grad()
+def _to_cpu_attentions(attentions) -> List[torch.Tensor]:
+    """Normalize a list of attention maps to CPU float tensors."""
+    out = []
+    if not attentions:
+        return out
+    for a in attentions:
+        if a is None:
+            continue
+        if isinstance(a, torch.Tensor):
+            out.append(a.detach().float().cpu())
+    return out
+
+
+@torch.no_grad()
+def generate_attention_distance_per_head_heatmap_from_maps(
+    attentions: List[torch.Tensor],
+    grid_size: int,
+    radius: int = 1,
+    figsize: Tuple[int, int] = (10, 4),
+) -> Image.Image:
+    """Same as `generate_attention_distance_per_head_heatmap`, but reuses precomputed maps."""
+    attentions = _to_cpu_attentions(attentions)
+    if not attentions:
+        return Image.new("RGB", (400, 300))
+
+    num_layers = len(attentions)
+    num_heads = attentions[0].shape[1]
+
+    dist_map = np.zeros((num_layers, num_heads), dtype=np.float32)
+    local_map = np.zeros((num_layers, num_heads), dtype=np.float32)
+
+    for li, attn in enumerate(attentions):
+        m = compute_attention_distance_metrics(attn, grid_size=grid_size, radius=radius)
+        d = m.get("patch_attn_distance_per_head", [0.0] * num_heads)
+        l = m.get("patch_local_mass_r1_per_head", [0.0] * num_heads)
+        if len(d) == num_heads:
+            dist_map[li, :] = np.asarray(d, dtype=np.float32)
+        if len(l) == num_heads:
+            local_map[li, :] = np.asarray(l, dtype=np.float32)
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    for ax, data, title, cmap in [
+        (axes[0], dist_map, "Patch Attn Distance (per head)", "viridis"),
+        (axes[1], local_map, f"Local Mass r≤{radius} (per head)", "magma"),
+    ]:
+        im = ax.imshow(data, aspect="auto", cmap=cmap, origin="lower")
+        ax.set_xlabel("Head")
+        ax.set_ylabel("Layer")
+        ax.set_title(title)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    plt.tight_layout()
+    img = _fig_to_pil(fig)
+    plt.close(fig)
+    return img
+
+
+@torch.no_grad()
+def generate_attention_entropy_per_head_heatmap_from_maps(
+    attentions: List[torch.Tensor],
+    figsize: Tuple[int, int] = (10, 4),
+) -> Image.Image:
+    """Same as `generate_attention_entropy_per_head_heatmap`, but reuses precomputed maps."""
+    attentions = _to_cpu_attentions(attentions)
+    if not attentions:
+        return Image.new("RGB", (400, 300))
+
+    num_layers = len(attentions)
+    num_heads = attentions[0].shape[1]
+    eps = 1e-8
+
+    ent_map = np.zeros((num_layers, num_heads), dtype=np.float32)
+    for li, attn in enumerate(attentions):
+        head_ent = -(attn * torch.log(attn + eps)).sum(dim=-1).mean(dim=-1)  # (B,H)
+        ent_map[li, :] = head_ent.mean(dim=0).numpy().astype(np.float32)
+
+    fig, ax = plt.subplots(1, 1, figsize=figsize)
+    im = ax.imshow(ent_map, aspect="auto", cmap="viridis", origin="lower")
+    ax.set_xlabel("Head")
+    ax.set_ylabel("Layer")
+    ax.set_title("Attention Entropy (per head)")
+    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    img = _fig_to_pil(fig)
+    plt.close(fig)
+    return img
+
+
+@torch.no_grad()
 def generate_attention_distance_per_head_heatmap(
     model,
     images: torch.Tensor,
@@ -224,38 +314,40 @@ def generate_attention_distance_per_head_heatmap(
 
     if not attentions:
         return Image.new("RGB", (400, 300))
+    return generate_attention_distance_per_head_heatmap_from_maps(
+        attentions, grid_size=grid_size, radius=radius, figsize=figsize
+    )
 
-    num_layers = len(attentions)
-    num_heads = attentions[0].shape[1]
 
-    dist_map = np.zeros((num_layers, num_heads), dtype=np.float32)
-    local_map = np.zeros((num_layers, num_heads), dtype=np.float32)
+@torch.no_grad()
+def generate_attention_entropy_per_head_heatmap(
+    model,
+    images: torch.Tensor,
+    device: torch.device,
+    figsize: Tuple[int, int] = (10, 4),
+) -> Image.Image:
+    """
+    Head×layer heatmap for attention entropy (per head).
 
-    for li, attn in enumerate(attentions):
-        m = compute_attention_distance_metrics(attn, grid_size=grid_size, radius=radius)
-        d = m.get("patch_attn_distance_per_head", [0.0] * num_heads)
-        l = m.get("patch_local_mass_r1_per_head", [0.0] * num_heads)
-        if len(d) == num_heads:
-            dist_map[li, :] = np.asarray(d, dtype=np.float32)
-        if len(l) == num_heads:
-            local_map[li, :] = np.asarray(l, dtype=np.float32)
+    Entropy is computed over the key dimension and averaged over query tokens.
+    Higher entropy => more uniform attention; lower => more peaked/focused.
+    """
+    model.eval()
 
-    fig, axes = plt.subplots(1, 2, figsize=figsize)
+    for block in model.encoder.blocks:
+        block.attn.output_attention = True
 
-    for ax, data, title, cmap in [
-        (axes[0], dist_map, "Patch Attn Distance (per head)", "viridis"),
-        (axes[1], local_map, f"Local Mass r≤{radius} (per head)", "magma"),
-    ]:
-        im = ax.imshow(data, aspect="auto", cmap=cmap, origin="lower")
-        ax.set_xlabel("Head")
-        ax.set_ylabel("Layer")
-        ax.set_title(title)
-        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    images = images.to(device, non_blocking=True)
+    _ = model.encoder(images)
 
-    plt.tight_layout()
-    img = _fig_to_pil(fig)
-    plt.close(fig)
-    return img
+    attentions = model.encoder.get_attention_maps()
+
+    for block in model.encoder.blocks:
+        block.attn.output_attention = False
+        if hasattr(block.attn, "attn_map"):
+            block.attn.attn_map = None
+
+    return generate_attention_entropy_per_head_heatmap_from_maps(attentions, figsize=figsize)
 
 
 def generate_head_ablation_heatmap(
@@ -1393,16 +1485,28 @@ def generate_embedding_projection(
 
     all_embeddings = []
     all_labels = []
+    collected = 0
 
     for views, labels in dataloader:
-        if len(all_embeddings) * views.shape[0] >= max_samples:
+        if collected >= max_samples:
             break
 
-        views = views.to(device)
-        emb, _ = model(views)
+        # Accept either (B,V,C,H,W) or a list/tuple of crops.
+        if isinstance(views, (list, tuple)):
+            views = views[0].unsqueeze(1)  # (B,1,C,H,W)
+
+        views = views.to(device, non_blocking=True)
+        emb, _ = model(views)  # (B*V, D2)
+
+        B, V = views.shape[0], views.shape[1]
+        try:
+            emb = emb.reshape(B, V, -1)[:, 0]  # first view -> (B, D2)
+        except Exception:
+            emb = emb[:B]
 
         all_embeddings.append(emb.detach().cpu())
         all_labels.append(labels)
+        collected += int(labels.shape[0])
 
     embeddings = torch.cat(all_embeddings, dim=0)[:max_samples]
     labels = torch.cat(all_labels, dim=0)[:max_samples]
@@ -1471,6 +1575,99 @@ def generate_embedding_projection(
     img = _fig_to_pil(fig)
     plt.close(fig)
 
+    return img
+
+
+@torch.no_grad()
+def generate_embedding_pca_scatter(
+    model,
+    dataloader,
+    device: torch.device,
+    max_samples: int = 500,
+    view_idx: int = 0,
+    use_last_layer_only: bool = True,
+    figsize: Tuple[int, int] = (10, 8),
+    class_names: Optional[List[str]] = None,
+) -> Image.Image:
+    """
+    Stable 2D PCA scatter of pooled embeddings (colored by class).
+
+    Unlike t-SNE/UMAP, this is deterministic and easier to compare across runs.
+    """
+    model.eval()
+
+    all_embeddings = []
+    all_labels = []
+    collected = 0
+
+    for views, labels in dataloader:
+        if collected >= max_samples:
+            break
+
+        if isinstance(views, (list, tuple)):
+            views = views[0].unsqueeze(1)  # (B,1,C,H,W)
+
+        views = views.to(device, non_blocking=True)
+        emb, _ = model(views)  # (B*V, D2)
+
+        B, V = views.shape[0], views.shape[1]
+        try:
+            emb = emb.reshape(B, V, -1)[:, min(view_idx, V - 1)]
+        except Exception:
+            emb = emb[:B]
+
+        if use_last_layer_only and emb.shape[1] >= 2:
+            d = emb.shape[1] // 2
+            emb = emb[:, d:]
+
+        all_embeddings.append(emb.detach().float().cpu())
+        all_labels.append(labels.detach().cpu())
+        collected += int(labels.shape[0])
+
+    if not all_embeddings:
+        return Image.new("RGB", (400, 300))
+
+    z = torch.cat(all_embeddings, dim=0)[:max_samples]
+    y = torch.cat(all_labels, dim=0)[:max_samples]
+
+    z = z - z.mean(dim=0, keepdim=True)
+    try:
+        _u, s, vh = torch.linalg.svd(z, full_matrices=False)
+        pc2 = (z @ vh[:2].T).numpy()
+        var = (s**2) / max(int(z.shape[0] - 1), 1)
+        evr = (var[:2] / (var.sum() + 1e-12)).numpy()
+    except Exception:
+        pc2 = z[:, :2].numpy()
+        evr = np.array([0.0, 0.0], dtype=np.float32)
+
+    unique = torch.unique(y).numpy()
+    colors = plt.cm.tab20(np.linspace(0, 1, max(len(unique), 1)))
+
+    fig, ax = plt.subplots(figsize=figsize)
+    y_np = y.numpy()
+    for idx, label in enumerate(unique):
+        mask = y_np == label
+        li = int(label)
+        name = class_names[li] if class_names and li < len(class_names) else f"Class {li}"
+        ax.scatter(
+            pc2[mask, 0],
+            pc2[mask, 1],
+            c=[colors[idx % len(colors)]],
+            label=name,
+            alpha=0.7,
+            s=18,
+            edgecolors="none",
+        )
+
+    ax.set_xlabel(f"PC1 ({evr[0]*100:.1f}% var)")
+    ax.set_ylabel(f"PC2 ({evr[1]*100:.1f}% var)")
+    ax.set_title("Embedding PCA (2D)")
+    ax.grid(True, alpha=0.2)
+    ax.legend(loc="best", fontsize=8, ncol=2)
+    plt.tight_layout()
+
+    img = _fig_to_pil(fig)
+    plt.close(fig)
     return img
 
 

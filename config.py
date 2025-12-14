@@ -72,22 +72,42 @@ class Config:
     wandb_project: str = "lejepa-jit"
     use_wandb: bool = True
 
-    # Visualization intervals (default: every epoch)
-    layer_attention_interval: int = 1
-    per_head_attention_interval: int = 1
-    head_importance_interval: int = 1
-    token_similarity_interval: int = 1
-    rsm_interval: int = 1
-    collapse_monitor_interval: int = 1
-    gradient_flow_interval: int = 1
-    training_dashboard_interval: int = 1
-    embedding_projection_interval: int = 1
-    drift_interval: int = 1
+    # =============================================================================
+    # Diagnostics / Visualization cadence
+    # Note: any interval <= 0 disables that diagnostic.
+    # =============================================================================
+
+    # Core visualizations (lightweight, most useful for qualitative progress)
+    pca_vis_interval: int = 5  # patch-PCA map (spatial semantics)
+    attn_rollout_interval: int = 5  # attention rollout overlay
+
+    # Redundant/optional visuals (disabled by default; enable when investigating)
+    attn_grid_interval: int = 0  # raw last-layer attention (often redundant with rollout)
+    head_importance_interval: int = 0  # older entropy/max/variance heatmap (replaced by per-head entropy)
+    attention_difference_interval: int = 0  # epoch-to-epoch diff tracker (assumes CLS; can be noisy)
+    training_dashboard_interval: int = 0  # WandB already plots scalars; image is redundant
+    embedding_projection_interval: int = 0  # t-SNE/UMAP (expensive + noisy)
+
+    # Embedding-space visuals for benchmarking
+    embedding_pca_scatter_interval: int = 10  # class separation trend (stable)
+
+    # Attention/representation visuals (moderately expensive)
+    layer_attention_interval: int = 10
+    per_head_attention_interval: int = 25
+    token_similarity_interval: int = 25
+    rsm_interval: int = 50
+    collapse_monitor_interval: int = 10
+    gradient_flow_interval: int = 10
+    drift_interval: int = 5
 
     # PCA visualization controls (output only; does not affect training)
     pca_vis_size: int = 224
     pca_resample: str = "nearest"  # "nearest" | "bilinear"
     pca_per_image: bool = False
+
+    # Optional GIF logging (can create lots of artifacts)
+    pca_gif_interval: int = 0
+    attn_gif_interval: int = 0
 
     # Representation eval metrics (epoch-level)
     knn_interval: int = 1
@@ -98,8 +118,8 @@ class Config:
     lid_max_samples: int = 1024
 
     # Transformer diagnostics (epoch-level on fixed batch)
-    transformer_diag_interval: int = 1
-    block_diag_interval: int = 1
+    transformer_diag_interval: int = 5
+    block_diag_interval: int = 10
 
     # Expensive diagnostics (epoch-level; can be slow)
     diagnostic_batch_size: int = 64
@@ -107,21 +127,22 @@ class Config:
     heavy_diagnostic_batch_size: int = 8
     # Skip heavy diagnostics if CUDA free memory is below this threshold (MiB).
     heavy_diag_min_free_mb: int = 1024
-    gns_interval: int = 1
+    gns_interval: int = 25
     gns_microbatches: int = 4
-    sharpness_interval: int = 1
+    sharpness_interval: int = 25
     sharpness_power_iters: int = 10
-    landscape_interval: int = 1
+    landscape_interval: int = 50
     landscape_radius: float = 0.05
     landscape_points: int = 11
 
     # Additional heavy diagnostics (epoch-level; can be slow)
-    attn_distance_headmap_interval: int = 1
+    attn_distance_headmap_interval: int = 10
+    attn_entropy_headmap_interval: int = 10
     attn_logits_interval: int = 5
     mlp_output_stats_interval: int = 5
-    head_ablation_interval: int = 10
+    head_ablation_interval: int = 50
     head_ablation_layers: int = 1  # number of last layers to ablate
-    landscape2d_interval: int = 10
+    landscape2d_interval: int = 50
     landscape2d_radius: float = 0.05
     landscape2d_points: int = 11
 
