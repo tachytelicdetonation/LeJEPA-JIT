@@ -1213,35 +1213,54 @@ def main():
         try:
             import wandb
 
-            wandb.init(
-                project=config.wandb_project,
-                config=vars(config),
-                name=f"{config.encoder}-{time.strftime('%Y%m%d_%H%M%S')}",
-            )
-            # Define x-axes for different metric types
-            wandb.define_metric("step")
-            wandb.define_metric("epoch")
-            wandb.define_metric("train/*", step_metric="step")
-            wandb.define_metric("opt/*", step_metric="step")
-            wandb.define_metric("opt_block/*", step_metric="step")
-            wandb.define_metric("rep/*", step_metric="step")
-            wandb.define_metric("sys/*", step_metric="step")
-            wandb.define_metric("attn/*", step_metric="step")
-            wandb.define_metric("attn_layer/*", step_metric="step")
-            wandb.define_metric("epoch_*", step_metric="epoch")
-            wandb.define_metric("val_*", step_metric="epoch")
-            wandb.define_metric("attention/*", step_metric="epoch")
-            wandb.define_metric("collapse/*", step_metric="epoch")
-            wandb.define_metric("epoch_attn_logit/*", step_metric="epoch")
-            wandb.define_metric("epoch_mlp/*", step_metric="epoch")
-            wandb.define_metric("epoch_rep/*", step_metric="epoch")
-            wandb.define_metric("knn/*", step_metric="epoch")
-            wandb.define_metric("lid/*", step_metric="epoch")
-            wandb.define_metric("epoch_attn_layer/*", step_metric="epoch")
-            wandb.define_metric("epoch_block/*", step_metric="epoch")
-            wandb.define_metric("epoch_opt/*", step_metric="epoch")
-            wandb.define_metric("gns/*", step_metric="epoch")
-            wandb.define_metric("sharpness/*", step_metric="epoch")
+            try:
+                wandb.init(
+                    project=config.wandb_project,
+                    config=vars(config),
+                    name=f"{config.encoder}-{time.strftime('%Y%m%d_%H%M%S')}",
+                )
+            except Exception as e:
+                # Common failure modes: invalid/expired API key, missing permissions (403),
+                # or networking/proxy issues. Prefer continuing training with offline logs.
+                print(f"wandb init failed ({type(e).__name__}: {e}). Falling back to offline mode.")
+                try:
+                    wandb.init(
+                        project=config.wandb_project,
+                        config=vars(config),
+                        name=f"{config.encoder}-{time.strftime('%Y%m%d_%H%M%S')}",
+                        mode="offline",
+                    )
+                except Exception as e2:
+                    print(
+                        f"wandb offline init failed ({type(e2).__name__}: {e2}). Disabling wandb logging."
+                    )
+                    config.use_wandb = False
+
+            if config.use_wandb:
+                # Define x-axes for different metric types
+                wandb.define_metric("step")
+                wandb.define_metric("epoch")
+                wandb.define_metric("train/*", step_metric="step")
+                wandb.define_metric("opt/*", step_metric="step")
+                wandb.define_metric("opt_block/*", step_metric="step")
+                wandb.define_metric("rep/*", step_metric="step")
+                wandb.define_metric("sys/*", step_metric="step")
+                wandb.define_metric("attn/*", step_metric="step")
+                wandb.define_metric("attn_layer/*", step_metric="step")
+                wandb.define_metric("epoch_*", step_metric="epoch")
+                wandb.define_metric("val_*", step_metric="epoch")
+                wandb.define_metric("attention/*", step_metric="epoch")
+                wandb.define_metric("collapse/*", step_metric="epoch")
+                wandb.define_metric("epoch_attn_logit/*", step_metric="epoch")
+                wandb.define_metric("epoch_mlp/*", step_metric="epoch")
+                wandb.define_metric("epoch_rep/*", step_metric="epoch")
+                wandb.define_metric("knn/*", step_metric="epoch")
+                wandb.define_metric("lid/*", step_metric="epoch")
+                wandb.define_metric("epoch_attn_layer/*", step_metric="epoch")
+                wandb.define_metric("epoch_block/*", step_metric="epoch")
+                wandb.define_metric("epoch_opt/*", step_metric="epoch")
+                wandb.define_metric("gns/*", step_metric="epoch")
+                wandb.define_metric("sharpness/*", step_metric="epoch")
         except ImportError:
             print("wandb not installed, skipping logging")
             config.use_wandb = False
