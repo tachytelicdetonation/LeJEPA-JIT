@@ -138,6 +138,10 @@ class Config:
     # Additional heavy diagnostics (epoch-level; can be slow)
     attn_distance_headmap_interval: int = 10
     attn_entropy_headmap_interval: int = 10
+    pocp_interval: int = 25  # RoPE POCP (layer×head + distance curves)
+    pocp_num_pairs: int = 512
+    pocp_num_distance_bins: int = 6
+    pocp_freq_planes: int = 32
     attn_logits_interval: int = 5
     mlp_output_stats_interval: int = 5
     head_ablation_interval: int = 50

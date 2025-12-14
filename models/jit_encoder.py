@@ -17,6 +17,7 @@ Removed (diffusion-specific):
 - FinalLayer denoising head
 """
 
+import math
 from typing import Optional
 
 import torch
@@ -208,6 +209,152 @@ def apply_rotary_emb(
     return q_rotated, k_rotated
 
 
+@torch.no_grad()
+def _compute_pocp_stats(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    *,
+    grid_size: Optional[int],
+    num_pairs: int,
+    num_distance_bins: int,
+    freq_planes: int,
+) -> Optional[dict]:
+    """
+    Compute POCP ("proportion of obtuse angles") diagnostics for RoPE.
+
+    Notes:
+      - This codebase uses split-half rotary; each RoPE 2D plane is (d, d + head_dim/2).
+      - A plane is "obtuse" if the 2D dot product between (q_d, q_{d+half}) and
+        (k_d, k_{d+half}) is negative.
+      - High/low-frequency splits are reported by plane index: early planes are higher-frequency.
+    """
+    if q is None or k is None or q.ndim != 4 or k.ndim != 4:
+        return None
+
+    B, H, N, D = q.shape
+    if N < 2 or D < 2 or (D % 2) != 0:
+        return None
+
+    head_half = D // 2
+
+    # For vision, optionally ignore CLS (token 0) if the layout matches (grid^2 + 1).
+    start = 0
+    if grid_size is not None and int(grid_size) > 0 and N == int(grid_size) * int(grid_size) + 1:
+        start = 1
+
+    P = N - start
+    if P < 2:
+        return None
+
+    num_pairs = int(num_pairs)
+    if num_pairs <= 0:
+        return None
+
+    # Sample token pairs (with replacement). Keep it cheap and deterministic-ish.
+    idx_i = torch.randint(0, P, (num_pairs,), device=q.device)
+    idx_j = torch.randint(0, P, (num_pairs,), device=q.device)
+    same = idx_j == idx_i
+    if bool(same.any()):
+        idx_j[same] = (idx_j[same] + 1) % P
+
+    tok_i = idx_i + start
+    tok_j = idx_j + start
+
+    qi = q.index_select(2, tok_i).detach().float()  # (B,H,K,D)
+    kj = k.index_select(2, tok_j).detach().float()
+
+    qi1, qi2 = qi[..., :head_half], qi[..., head_half:]
+    kj1, kj2 = kj[..., :head_half], kj[..., head_half:]
+    dot2d = qi1 * kj1 + qi2 * kj2  # (B,H,K,head_half)
+    obtuse = (dot2d < 0).to(torch.float32)  # (B,H,K,head_half)
+
+    # Overall POCP: mean over planes, pairs, batch -> per head.
+    pocp_pair = obtuse.mean(dim=-1)  # (B,H,K)
+    pocp_per_head = pocp_pair.mean(dim=(0, 2))  # (H,)
+
+    k_planes = int(freq_planes)
+    if k_planes <= 0:
+        k_planes = min(32, head_half)
+    k_planes = max(1, min(k_planes, head_half))
+    pocp_high_per_head = obtuse[..., :k_planes].mean(dim=-1).mean(dim=(0, 2))
+    pocp_low_per_head = obtuse[..., -k_planes:].mean(dim=-1).mean(dim=(0, 2))
+
+    # Raw (unrotated) Q·K score for context.
+    qk_dot = (qi * kj).sum(dim=-1)  # (B,H,K)
+    qk_dot_mean = float(qk_dot.mean().item())
+    qk_dot_std = float(qk_dot.std().item()) if qk_dot.numel() > 1 else 0.0
+
+    # Distance-binned curves (mean over batch+heads for each bin).
+    num_distance_bins = int(num_distance_bins)
+    pocp_curve: list[float] = []
+    pocp_high_curve: list[float] = []
+    pocp_low_curve: list[float] = []
+    qk_curve: list[float] = []
+    dist_edges: Optional[list[float]] = None
+
+    if num_distance_bins > 0:
+        if grid_size is not None and int(grid_size) > 0 and P == int(grid_size) * int(grid_size):
+            g = int(grid_size)
+            ri = idx_i // g
+            ci = idx_i % g
+            rj = idx_j // g
+            cj = idx_j % g
+            dist = torch.sqrt((ri - rj).float().pow(2) + (ci - cj).float().pow(2))
+            max_dist = float(math.sqrt(2.0) * (g - 1))
+        else:
+            dist = (idx_i - idx_j).abs().float()
+            max_dist = float(P - 1)
+
+        max_dist = max(1.0, max_dist)
+
+        if num_distance_bins == 1:
+            edges = [0.0, max_dist + 1e-6]
+        else:
+            edges_mid = torch.exp(
+                torch.linspace(
+                    math.log(1.0),
+                    math.log(max_dist + 1e-6),
+                    steps=num_distance_bins,
+                    device=dist.device,
+                )
+            )
+            edges = [0.0] + [float(x.item()) for x in edges_mid]
+        dist_edges = edges
+
+        for b in range(len(edges) - 1):
+            lo = edges[b]
+            hi = edges[b + 1]
+            m = (dist > lo) & (dist <= hi)
+            if bool(m.any()):
+                pocp_curve.append(float(pocp_pair[:, :, m].mean().item()))
+                pocp_high_curve.append(
+                    float(obtuse[:, :, m, :k_planes].mean().item())
+                )
+                pocp_low_curve.append(
+                    float(obtuse[:, :, m, -k_planes:].mean().item())
+                )
+                qk_curve.append(float(qk_dot[:, :, m].mean().item()))
+            else:
+                pocp_curve.append(float("nan"))
+                pocp_high_curve.append(float("nan"))
+                pocp_low_curve.append(float("nan"))
+                qk_curve.append(float("nan"))
+
+    return {
+        "pocp_per_head": pocp_per_head.detach().cpu(),
+        "pocp_high_per_head": pocp_high_per_head.detach().cpu(),
+        "pocp_low_per_head": pocp_low_per_head.detach().cpu(),
+        "pocp_curve": pocp_curve,
+        "pocp_high_curve": pocp_high_curve,
+        "pocp_low_curve": pocp_low_curve,
+        "qk_curve": qk_curve,
+        "dist_edges": dist_edges,
+        "qk_dot_mean": qk_dot_mean,
+        "qk_dot_std": qk_dot_std,
+        "k_planes": int(k_planes),
+    }
+
+
 class Attention(nn.Module):
     """
     Multi-head self-attention with RoPE and RMSNorm on Q/K.
@@ -224,8 +371,10 @@ class Attention(nn.Module):
         super().__init__()
         self.output_attention = False
         self.output_attn_logits = False
+        self.output_pocp = False
         self.attn_map = None
         self.attn_logits = None
+        self.pocp_stats = None
         self.head_mask = None
 
         self.num_heads = num_heads
@@ -238,6 +387,12 @@ class Attention(nn.Module):
         self.attn_drop = nn.Dropout(attn_drop)
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
+
+        # POCP diagnostics knobs (set at runtime by the training loop).
+        self.pocp_num_pairs = 512
+        self.pocp_num_distance_bins = 6
+        self.pocp_freq_planes = 32
+        self.pocp_grid_size = None
 
     def forward(
         self,
@@ -264,6 +419,16 @@ class Attention(nn.Module):
         # RMSNorm on Q and K
         q = self.q_norm(q)
         k = self.k_norm(k)
+
+        if getattr(self, "output_pocp", False):
+            self.pocp_stats = _compute_pocp_stats(
+                q,
+                k,
+                grid_size=getattr(self, "pocp_grid_size", None),
+                num_pairs=getattr(self, "pocp_num_pairs", 512),
+                num_distance_bins=getattr(self, "pocp_num_distance_bins", 6),
+                freq_planes=getattr(self, "pocp_freq_planes", 32),
+            )
 
         # Apply rotary embeddings
         q, k = apply_rotary_emb(q, k, rope_cos, rope_sin)

@@ -126,6 +126,41 @@ def generate_layerwise_curves(
     return pil
 
 
+def generate_xy_curves(
+    xs: List[float],
+    curves: Dict[str, List[float]],
+    title: str,
+    xlabel: str = "x",
+    ylabel: str = "Value",
+) -> Image.Image:
+    """Plot one or more curves against explicit x-values and return as PIL."""
+    fig, ax = plt.subplots(figsize=(7.5, 3.5))
+    ax.set_title(title)
+
+    if not xs or not curves:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        ax.axis("off")
+        pil = _fig_to_pil(fig)
+        plt.close(fig)
+        return pil
+
+    for name, ys in curves.items():
+        if not ys:
+            continue
+        m = min(len(xs), len(ys))
+        ax.plot(xs[:m], ys[:m], marker="o", linewidth=2, label=name)
+
+    ax.set_xlabel(xlabel)
+    ax.set_ylabel(ylabel)
+    ax.grid(True, alpha=0.3)
+    if len(curves) > 1:
+        ax.legend(loc="best", fontsize=8)
+
+    pil = _fig_to_pil(fig)
+    plt.close(fig)
+    return pil
+
+
 def generate_loss_landscape_slice(
     alphas: List[float],
     losses: List[float],
@@ -271,6 +306,65 @@ def generate_attention_entropy_per_head_heatmap_from_maps(
     ax.set_ylabel("Layer")
     ax.set_title("Attention Entropy (per head)")
     plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    plt.tight_layout()
+    img = _fig_to_pil(fig)
+    plt.close(fig)
+    return img
+
+
+@torch.no_grad()
+def generate_pocp_per_head_heatmaps(
+    pocp: torch.Tensor | np.ndarray,
+    pocp_high: Optional[torch.Tensor | np.ndarray] = None,
+    pocp_low: Optional[torch.Tensor | np.ndarray] = None,
+    *,
+    title_prefix: str = "POCP",
+    figsize: Tuple[int, int] = (12, 4),
+) -> Image.Image:
+    """
+    Head×layer heatmaps for POCP ("proportion of obtuse angles") diagnostics.
+
+    Inputs are expected to be shaped (num_layers, num_heads), with values in [0, 1].
+    If `pocp_high` and `pocp_low` are provided, plots 3 panels (overall/high/low).
+    """
+
+    def _to_np(x):
+        if x is None:
+            return None
+        if isinstance(x, torch.Tensor):
+            return x.detach().float().cpu().numpy().astype(np.float32)
+        return np.asarray(x, dtype=np.float32)
+
+    base = _to_np(pocp)
+    hi = _to_np(pocp_high)
+    lo = _to_np(pocp_low)
+
+    if base is None or base.size == 0:
+        return Image.new("RGB", (400, 300))
+
+    panels = [(base, f"{title_prefix} (overall)")]
+    if hi is not None and lo is not None:
+        panels.append((hi, f"{title_prefix} (high-freq planes)"))
+        panels.append((lo, f"{title_prefix} (low-freq planes)"))
+
+    fig, axes = plt.subplots(1, len(panels), figsize=figsize)
+    if len(panels) == 1:
+        axes = [axes]
+
+    for ax, data, title in panels:
+        im = ax.imshow(
+            data,
+            aspect="auto",
+            cmap="viridis",
+            origin="lower",
+            vmin=0.0,
+            vmax=1.0,
+        )
+        ax.set_xlabel("Head")
+        ax.set_ylabel("Layer")
+        ax.set_title(title)
+        plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
     plt.tight_layout()
     img = _fig_to_pil(fig)
     plt.close(fig)

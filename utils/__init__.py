@@ -47,6 +47,8 @@ from utils.visualization import (
     # New: Training dashboard
     generate_training_dashboard,
     generate_embedding_spectrum,
+    generate_xy_curves,
+    generate_pocp_per_head_heatmaps,
 )
 
 __all__ = [
@@ -84,5 +86,7 @@ __all__ = [
     "generate_collapse_monitor",
     "generate_training_dashboard",
     "generate_embedding_spectrum",
+    "generate_xy_curves",
+    "generate_pocp_per_head_heatmaps",
     "AttentionTracker",
 ]

@@ -1328,9 +1328,11 @@ def main():
         generate_embedding_projection,
         generate_collapse_monitor,
         generate_layerwise_curves,
+        generate_xy_curves,
         generate_loss_landscape_slice,
         generate_loss_landscape_2d,
         generate_head_ablation_heatmap,
+        generate_pocp_per_head_heatmaps,
         AttentionTracker,
     )
 
@@ -1933,21 +1935,181 @@ def main():
                     )
 
                 # 12. Transformer attention diagnostics (fixed batch; interval-gated)
-                need_attn = config.use_wandb and (
+                need_attn_maps = config.use_wandb and (
                     _every_or_first(epoch, config.transformer_diag_interval)
                     or _every_or_first(epoch, config.attn_distance_headmap_interval)
                     or _every_or_first(epoch, getattr(config, "attn_entropy_headmap_interval", 0))
                 )
-                if need_attn:
+                need_pocp = config.use_wandb and _every_or_first(
+                    epoch, getattr(config, "pocp_interval", 0)
+                )
+                need_forward = need_attn_maps or need_pocp
+
+                attns = []
+                pocp_layer_stats = None
+                if need_forward:
                     with torch.no_grad():
+                        grid_size = config.img_size // config.patch_size
                         for blk in model.encoder.blocks:
-                            blk.attn.output_attention = True
+                            blk.attn.output_attention = bool(need_attn_maps)
+                            blk.attn.output_pocp = bool(need_pocp)
+                            if need_pocp:
+                                blk.attn.pocp_grid_size = grid_size
+                                blk.attn.pocp_num_pairs = int(
+                                    getattr(config, "pocp_num_pairs", 512)
+                                )
+                                blk.attn.pocp_num_distance_bins = int(
+                                    getattr(config, "pocp_num_distance_bins", 6)
+                                )
+                                blk.attn.pocp_freq_planes = int(
+                                    getattr(config, "pocp_freq_planes", 32)
+                                )
                         _ = model.encoder(vis_images)
-                        attns = model.encoder.get_attention_maps()
+                        if need_attn_maps:
+                            attns = model.encoder.get_attention_maps()
+                        if need_pocp:
+                            pocp_layer_stats = [
+                                getattr(blk.attn, "pocp_stats", None)
+                                for blk in model.encoder.blocks
+                            ]
                         for blk in model.encoder.blocks:
                             blk.attn.output_attention = False
+                            blk.attn.output_pocp = False
                             if hasattr(blk.attn, "attn_map"):
                                 blk.attn.attn_map = None
+                            if hasattr(blk.attn, "pocp_stats"):
+                                blk.attn.pocp_stats = None
+
+                    if need_pocp and pocp_layer_stats:
+                        import math
+                        import numpy as np
+
+                        num_layers = len(pocp_layer_stats)
+                        num_heads = int(getattr(config, "num_heads", 0)) or 1
+                        pocp_map = np.full((num_layers, num_heads), np.nan, dtype=np.float32)
+                        pocp_high_map = np.full((num_layers, num_heads), np.nan, dtype=np.float32)
+                        pocp_low_map = np.full((num_layers, num_heads), np.nan, dtype=np.float32)
+
+                        dist_edges = None
+                        curves = []
+                        curves_hi = []
+                        curves_lo = []
+                        curves_qk = []
+                        qk_means = []
+                        qk_stds = []
+                        k_planes = None
+
+                        for li, s in enumerate(pocp_layer_stats):
+                            if not s:
+                                continue
+                            ph = s.get("pocp_per_head", None)
+                            hh = s.get("pocp_high_per_head", None)
+                            ll = s.get("pocp_low_per_head", None)
+                            if isinstance(ph, torch.Tensor) and ph.numel() == num_heads:
+                                pocp_map[li, :] = ph.detach().float().cpu().numpy()
+                            if isinstance(hh, torch.Tensor) and hh.numel() == num_heads:
+                                pocp_high_map[li, :] = hh.detach().float().cpu().numpy()
+                            if isinstance(ll, torch.Tensor) and ll.numel() == num_heads:
+                                pocp_low_map[li, :] = ll.detach().float().cpu().numpy()
+
+                            if dist_edges is None and s.get("dist_edges", None) is not None:
+                                dist_edges = s.get("dist_edges", None)
+
+                            if s.get("pocp_curve", None):
+                                curves.append(list(s.get("pocp_curve")))
+                                curves_hi.append(list(s.get("pocp_high_curve", [])))
+                                curves_lo.append(list(s.get("pocp_low_curve", [])))
+                                curves_qk.append(list(s.get("qk_curve", [])))
+
+                            if "qk_dot_mean" in s:
+                                qk_means.append(float(s["qk_dot_mean"]))
+                            if "qk_dot_std" in s:
+                                qk_stds.append(float(s["qk_dot_std"]))
+                            if k_planes is None and "k_planes" in s:
+                                k_planes = int(s["k_planes"])
+
+                        pocp_mean = float(np.nanmean(pocp_map)) if np.isfinite(pocp_map).any() else 0.0
+                        pocp_high_mean = (
+                            float(np.nanmean(pocp_high_map)) if np.isfinite(pocp_high_map).any() else 0.0
+                        )
+                        pocp_low_mean = (
+                            float(np.nanmean(pocp_low_map)) if np.isfinite(pocp_low_map).any() else 0.0
+                        )
+                        wandb.log(
+                            {
+                                "epoch_pocp/mean": pocp_mean,
+                                "epoch_pocp/high_freq_mean": pocp_high_mean,
+                                "epoch_pocp/low_freq_mean": pocp_low_mean,
+                                "epoch_pocp/qk_dot_mean": (sum(qk_means) / max(len(qk_means), 1)),
+                                "epoch_pocp/qk_dot_std": (sum(qk_stds) / max(len(qk_stds), 1)),
+                                "epoch_pocp/k_planes": float(k_planes or 0),
+                            },
+                            commit=False,
+                        )
+
+                        pocp_img = generate_pocp_per_head_heatmaps(
+                            pocp_map,
+                            pocp_high_map,
+                            pocp_low_map,
+                            title_prefix=f"POCP (Epoch {epoch})",
+                        )
+                        wandb.log(
+                            {"vis/pocp_per_head": wandb.Image(pocp_img, caption=f"Epoch {epoch}")},
+                            commit=False,
+                        )
+
+                        # Distance curves aggregated across layers (ignore NaNs).
+                        if dist_edges is not None and curves:
+                            edges = list(dist_edges)
+                            centers = []
+                            for b in range(len(edges) - 1):
+                                lo = float(edges[b])
+                                hi = float(edges[b + 1])
+                                if lo <= 0.0:
+                                    centers.append(0.5 * hi)
+                                else:
+                                    centers.append(math.sqrt(lo * hi))
+
+                            def _nanmean_curve(curve_list: list[list[float]]) -> list[float]:
+                                if not curve_list:
+                                    return []
+                                a = np.asarray(curve_list, dtype=np.float32)
+                                with np.errstate(all="ignore"):
+                                    m = np.nanmean(a, axis=0)
+                                return [float(x) for x in m.tolist()]
+
+                            pocp_curve = _nanmean_curve(curves)
+                            pocp_hi_curve = _nanmean_curve(curves_hi)
+                            pocp_lo_curve = _nanmean_curve(curves_lo)
+                            qk_curve = _nanmean_curve(curves_qk)
+
+                            pocp_curve_plot = generate_xy_curves(
+                                centers,
+                                {"POCP": pocp_curve, "POCP_high": pocp_hi_curve, "POCP_low": pocp_lo_curve},
+                                title=f"POCP vs Patch Distance (Epoch {epoch})",
+                                xlabel="patch distance (L2)",
+                                ylabel="POCP",
+                            )
+                            wandb.log(
+                                {"vis/pocp_by_distance": wandb.Image(pocp_curve_plot, caption=f"Epoch {epoch}")},
+                                commit=False,
+                            )
+
+                            qk_curve_plot = generate_xy_curves(
+                                centers,
+                                {"Q·K (unrotated)": qk_curve},
+                                title=f"Unrotated Q·K vs Patch Distance (Epoch {epoch})",
+                                xlabel="patch distance (L2)",
+                                ylabel="mean Q·K",
+                            )
+                            wandb.log(
+                                {
+                                    "vis/pocp_qk_by_distance": wandb.Image(
+                                        qk_curve_plot, caption=f"Epoch {epoch}"
+                                    )
+                                },
+                                commit=False,
+                            )
 
                     if attns:
                         last_attn = attns[-1]
