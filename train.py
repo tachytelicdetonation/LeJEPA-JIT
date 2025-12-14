@@ -19,6 +19,7 @@ Usage:
 """
 
 import argparse
+import copy
 import time
 from contextlib import nullcontext
 from pathlib import Path
@@ -52,6 +53,38 @@ from utils.metrics import (
     compute_encoder_block_opt_stats,
     estimate_intrinsic_dim_twonn,
 )
+
+
+def _cosine_ema_coeff(base: float, final: float, epoch: int, total_epochs: int) -> float:
+    """Cosine schedule for EMA coefficient (common in teacher-student / SWA-EMA setups)."""
+    if total_epochs <= 0:
+        return float(final)
+    # epoch is 1-based in this training script
+    t = float(epoch) / float(max(total_epochs, 1))
+    return float(final - 0.5 * (final - base) * (1.0 + torch.cos(torch.tensor(t * torch.pi)).item()))
+
+
+@torch.no_grad()
+def _ema_update_(teacher: nn.Module, student: nn.Module, ema_coeff: float) -> None:
+    """teacher = ema_coeff*teacher + (1-ema_coeff)*student (params + buffers)."""
+    m = float(ema_coeff)
+    if m <= 0.0:
+        teacher.load_state_dict(student.state_dict(), strict=True)
+        return
+    if m >= 1.0:
+        return
+
+    for teacher_group, student_group in [
+        (teacher.parameters(), student.parameters()),
+        (teacher.buffers(), student.buffers()),
+    ]:
+        for t, s in zip(teacher_group, student_group):
+            if t.dtype.is_floating_point:
+                t.mul_(m)
+                t.add_((1.0 - m) * s.to(dtype=t.dtype))
+            else:
+                # Non-floating buffers are copied directly.
+                t.copy_(s)
 
 def _amp_dtype_for_device(device: torch.device) -> torch.dtype:
     if device.type == "cuda":
@@ -87,6 +120,7 @@ def get_schedulers(
 
 def train_one_epoch(
     model: nn.Module,
+    teacher_model: nn.Module | None,
     probe: LinearProbe,
     loss_fn: LeJEPALoss,
     optimizer: torch.optim.Optimizer,
@@ -101,10 +135,12 @@ def train_one_epoch(
     """Train for one epoch."""
     model.train()
     probe.train()
+    if teacher_model is not None:
+        teacher_model.eval()
 
     total_loss = 0
     total_sigreg = 0
-    total_inv = 0
+    total_pred = 0
     total_probe_loss = 0
     total_correct = 0
     total_samples = 0
@@ -140,6 +176,10 @@ def train_one_epoch(
                 global_crops_tensor
             )  # emb: (B*2, D), proj: (2, B, D)
 
+            proj_global_teacher = None
+            if teacher_model is not None and config.teacher_student:
+                _, proj_global_teacher = teacher_model(global_crops_tensor)
+
             # 2. Forward Local Views
             if local_crops:
                 local_crops_tensor = torch.stack(
@@ -164,7 +204,7 @@ def train_one_epoch(
                 labels_for_probe = labels.repeat_interleave(2)
 
             # LeJEPA loss on all projections
-            loss_dict = loss_fn(proj)
+            loss_dict = loss_fn(proj, global_proj=proj_global_teacher)
             lejepa_loss = loss_dict["loss"]
 
             # Linear probe on Global embeddings (detached)
@@ -314,6 +354,16 @@ def train_one_epoch(
         scaler.update()
         scheduler.step()
 
+        # Optional SWA/EMA teacher update (paper notes small ViT gains when using SWA for centers)
+        if teacher_model is not None and config.teacher_student:
+            ema_coeff = _cosine_ema_coeff(
+                base=config.teacher_base_ema,
+                final=config.teacher_final_ema,
+                epoch=epoch,
+                total_epochs=config.epochs,
+            )
+            _ema_update_(teacher_model, model, ema_coeff)
+
         # Capture Grad Stats from hooks
         # attn_grads is a list populated by hooks
         current_grad_norm = 0.0
@@ -350,7 +400,7 @@ def train_one_epoch(
         # Accumulate losses
         total_loss += lejepa_loss.item()
         total_sigreg += loss_dict["sigreg_loss"].item()
-        total_inv += loss_dict["invariance_loss"].item()
+        total_pred += loss_dict["prediction_loss"].item()
         total_probe_loss += probe_loss.item()
         if batch_idx % config.log_interval == 0:
             total_entropy += current_entropy
@@ -367,7 +417,7 @@ def train_one_epoch(
                 {
                     "loss": f"{lejepa_loss.item():.4f}",
                     "sigreg": f"{loss_dict['sigreg_loss'].item():.4f}",
-                    "inv": f"{loss_dict['invariance_loss'].item():.4f}",
+                    "pred": f"{loss_dict['prediction_loss'].item():.4f}",
                     "acc": f"{100 * total_correct / total_samples:.1f}%",
                     "lr_e": f"{lr_encoder:.2e}",
                     "lr_p": f"{lr_probe:.2e}",
@@ -411,7 +461,7 @@ def train_one_epoch(
                         "train/total_loss": loss.item(),
                         "train/loss": lejepa_loss.item(),
                         "train/sigreg": loss_dict["sigreg_loss"].item(),
-                        "train/invariance": loss_dict["invariance_loss"].item(),
+                        "train/prediction": loss_dict["prediction_loss"].item(),
                         "train/probe_loss": probe_loss.item(),
                         "train/accuracy": 100 * total_correct / total_samples,
                         "train/batch_accuracy": batch_acc,
@@ -499,7 +549,7 @@ def train_one_epoch(
     return {
         "loss": total_loss / num_batches,
         "sigreg_loss": total_sigreg / num_batches,
-        "invariance_loss": total_inv / num_batches,
+        "prediction_loss": total_pred / num_batches,
         "probe_loss": total_probe_loss / num_batches,
         "accuracy": 100 * total_correct / total_samples,
     }
@@ -698,7 +748,9 @@ def _compute_training_loss_from_crops(
         "lejepa_loss": lejepa_loss.detach(),
         "probe_loss": probe_loss.detach(),
         "sigreg_loss": loss_dict.get("sigreg_loss", torch.tensor(0.0)).detach(),
-        "invariance_loss": loss_dict.get("invariance_loss", torch.tensor(0.0)).detach(),
+        "prediction_loss": loss_dict.get(
+            "prediction_loss", torch.tensor(0.0)
+        ).detach(),
     }
 
 
@@ -1227,6 +1279,14 @@ def main():
         **jit_kwargs,
     ).to(device)
 
+    teacher_model = None
+    if config.teacher_student:
+        # Paper notes that using SWA/teacher targets for the global-view centers can help ViTs.
+        # Keep optional since it doubles model memory.
+        teacher_model = copy.deepcopy(model).to(device)
+        teacher_model.requires_grad_(False)
+        teacher_model.eval()
+
     # Create linear probe
     # Online probe monitors training convergence using standard embeddings (last layer)
     # Full evaluation uses concatenated features (last 2 layers)
@@ -1244,9 +1304,13 @@ def main():
     loss_fn = LeJEPALoss(
         lambda_sigreg=config.lambda_sigreg,
         knots=config.sigreg_num_knots,
+        t_max=config.sigreg_max_t,
+        num_slices=config.sigreg_num_slices,
+        clip_value=config.sigreg_clip_value,
         multivariate=config.sigreg_multivariate,
         num_frequencies=config.sigreg_num_frequencies,
         sigma=config.sigreg_sigma,
+        num_global_views=config.num_global_views,
     )
 
     # Create optimizers with separate weight decay (matching reference)
@@ -1373,6 +1437,7 @@ def main():
         # Train
         train_metrics = train_one_epoch(
             model=model,
+            teacher_model=teacher_model,
             probe=probe,
             loss_fn=loss_fn,
             optimizer=optimizer,
@@ -1474,7 +1539,7 @@ def main():
         epoch_time = time.time() - start_time
         print(f"\nEpoch {epoch}/{config.epochs}")
         print(
-            f"  Loss: {train_metrics['loss']:.4f} (SIGReg: {train_metrics['sigreg_loss']:.4f}, Inv: {train_metrics['invariance_loss']:.4f})"
+            f"  Loss: {train_metrics['loss']:.4f} (SIGReg: {train_metrics['sigreg_loss']:.4f}, Pred: {train_metrics['prediction_loss']:.4f})"
         )
         print(f"  Train Acc: {train_metrics['accuracy']:.2f}%")
         if val_metrics_nette:
@@ -1494,7 +1559,7 @@ def main():
                     "epoch": epoch,
                     "epoch_loss": train_metrics["loss"],
                     "epoch_sigreg_loss": train_metrics["sigreg_loss"],
-                    "epoch_invariance_loss": train_metrics["invariance_loss"],
+                    "epoch_prediction_loss": train_metrics["prediction_loss"],
                     "epoch_probe_loss": train_metrics["probe_loss"],
                     "epoch_train_accuracy": train_metrics["accuracy"],
                     "val_accuracy_nette": val_metrics_nette.get("val_accuracy", 0),

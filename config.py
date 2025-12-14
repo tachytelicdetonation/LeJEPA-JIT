@@ -39,8 +39,11 @@ class Config:
     warmup_epochs: int = 15
 
     # Loss
-    lambda_sigreg: float = 0.02
+    # Paper suggests a robust default around 0.05 for ImageNet-scale runs.
+    # (Keep configurable; smaller values like 0.02 can work too.)
+    lambda_sigreg: float = 0.05
     num_views: int = 8  # 2 Global + 6 Local (Updated)
+    num_global_views: int = 2  # Paper: prediction targets come from global views only
 
     # Multi-Crop Parameters
     local_crops_number: int = 6
@@ -49,11 +52,19 @@ class Config:
     global_crops_scale: tuple = (0.4, 1.0)
 
     # SIGReg parameters
-    sigreg_multivariate: bool = True  # Use multivariate SIGReg (default)
+    # Paper default: sliced Epps–Pulley (univariate test) with ~1024 slices.
+    sigreg_multivariate: bool = False  # If True, use multivariate CF variant instead
+    sigreg_num_slices: int = 1024  # Number of random 1D projections (slices)
     sigreg_num_frequencies: int = 256  # For multivariate mode
     sigreg_sigma: float = 1.0  # Frequency scale for multivariate mode
     sigreg_num_knots: int = 17  # For univariate mode
     sigreg_max_t: float = 3.0  # For univariate mode
+    sigreg_clip_value: float | None = None  # Optional: clip tiny slice stats to 0
+
+    # Optional: SWA/EMA teacher for global centers (paper notes small ViT gains)
+    teacher_student: bool = False
+    teacher_base_ema: float = 0.996
+    teacher_final_ema: float = 1.0
 
     # Dataset
     dataset: str = "frgfm/imagenette"

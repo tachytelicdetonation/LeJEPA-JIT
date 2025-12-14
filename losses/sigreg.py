@@ -14,6 +14,31 @@ import torch
 import torch.nn as nn
 
 
+def _dist_is_initialized() -> bool:
+    return torch.distributed.is_available() and torch.distributed.is_initialized()
+
+
+def _dist_world_size() -> int:
+    if _dist_is_initialized():
+        return torch.distributed.get_world_size()
+    return 1
+
+
+def _dist_all_reduce_avg_(x: torch.Tensor) -> torch.Tensor:
+    if not _dist_is_initialized():
+        return x
+    torch.distributed.all_reduce(x, op=torch.distributed.ReduceOp.SUM)
+    x.div_(float(_dist_world_size()))
+    return x
+
+
+def _dist_all_reduce_max_(x: torch.Tensor) -> torch.Tensor:
+    if not _dist_is_initialized():
+        return x
+    torch.distributed.all_reduce(x, op=torch.distributed.ReduceOp.MAX)
+    return x
+
+
 class SIGReg(nn.Module):
     """
     SIGReg (Signature Regularization) loss using characteristic function matching.
@@ -27,20 +52,59 @@ class SIGReg(nn.Module):
     - Based on Epps-Pulley test statistic
     """
 
-    def __init__(self, knots: int = 17):
+    def __init__(
+        self,
+        knots: int = 17,
+        t_max: float = 3.0,
+        num_slices: int = 256,
+        clip_value: float | None = None,
+    ):
         """
         Args:
             knots: Number of quadrature points for characteristic function
         """
         super().__init__()
-        t = torch.linspace(0, 3, knots, dtype=torch.float32)
-        dt = 3 / (knots - 1)
+        if knots < 3 or knots % 2 != 1:
+            # Paper uses 17; odd helps with some quadrature rules (even though we use trapezoid).
+            raise ValueError(f"knots must be an odd integer >= 3, got {knots}")
+        if num_slices <= 0:
+            raise ValueError(f"num_slices must be > 0, got {num_slices}")
+
+        self.num_slices = int(num_slices)
+        self.clip_value = clip_value
+
+        t = torch.linspace(0, float(t_max), knots, dtype=torch.float32)
+        dt = float(t_max) / (knots - 1)
         weights = torch.full((knots,), 2 * dt, dtype=torch.float32)
         weights[[0, -1]] = dt
         window = torch.exp(-t.square() / 2.0)
         self.register_buffer("t", t)
         self.register_buffer("phi", window)
         self.register_buffer("weights", weights * window)
+        self.register_buffer("global_step", torch.zeros((), dtype=torch.long))
+
+        self._generator: torch.Generator | None = None
+        self._generator_device: torch.device | None = None
+
+    def _get_generator(self, device: torch.device, seed: int) -> torch.Generator:
+        if self._generator is None or self._generator_device != device:
+            self._generator = torch.Generator(device=device)
+            self._generator_device = device
+        self._generator.manual_seed(int(seed))
+        return self._generator
+
+    @torch.no_grad()
+    def _sample_slices(self, dim: int, device: torch.device) -> torch.Tensor:
+        # Deterministic seed across ranks (paper Algorithm 1 uses global_step)
+        seed_t = self.global_step.clone()
+        _dist_all_reduce_max_(seed_t)
+        g = self._get_generator(device, int(seed_t.item()))
+
+        A = torch.randn((dim, self.num_slices), device=device, generator=g)
+        A.div_(A.norm(p=2, dim=0).clamp_min_(1e-12))
+
+        self.global_step.add_(1)
+        return A
 
     def forward(self, proj: torch.Tensor) -> torch.Tensor:
         """
@@ -52,20 +116,38 @@ class SIGReg(nn.Module):
         Returns:
             Scalar loss value
         """
-        # Random projections for slicing high-dim to 1D
-        A = torch.randn(proj.size(-1), 256, device=proj.device)
-        A = A.div_(A.norm(p=2, dim=0))
+        # proj: (*, N, D) where N is samples (batch), D is feature dim
+        if proj.ndim < 2:
+            raise ValueError(f"proj must have shape (*, N, D); got {proj.shape}")
+        if proj.size(-2) <= 1:
+            # Avoid degenerate N scaling; still return something finite
+            return proj.new_tensor(0.0)
 
-        # Project and compute characteristic function
+        A = self._sample_slices(dim=proj.size(-1), device=proj.device)
+
+        # Project: (*, N, K)
+        x = proj @ A
+
         # Ensure buffers are on same device as proj
         t = self.t.to(proj.device)
         phi = self.phi.to(proj.device)
         weights = self.weights.to(proj.device)
 
-        x_t = (proj @ A).unsqueeze(-1) * t
-        err = (x_t.cos().mean(-3) - phi).square() + x_t.sin().mean(-3).square()
-        statistic = (err @ weights) * proj.size(-2)
-        return statistic.mean()
+        # Epps–Pulley characteristic function matching over t in [0, t_max]
+        # x_t: (*, N, K, knots)
+        x_t = x.unsqueeze(-1) * t
+        cos_mean = x_t.cos().mean(dim=-3)  # (*, K, knots)
+        sin_mean = x_t.sin().mean(dim=-3)  # (*, K, knots)
+
+        # DDP: synchronize means (paper's ref implementation averages across ranks)
+        _dist_all_reduce_avg_(cos_mean)
+        _dist_all_reduce_avg_(sin_mean)
+
+        err = (cos_mean - phi).square() + sin_mean.square()
+        stats = (err @ weights) * float(proj.size(-2) * _dist_world_size())  # (*, K)
+        if self.clip_value is not None:
+            stats = stats.masked_fill(stats < float(self.clip_value), 0.0)
+        return stats.mean()
 
 
 class MultivariateSIGReg(nn.Module):
@@ -140,23 +222,32 @@ class LeJEPALoss(nn.Module):
 
     def __init__(
         self,
-        lambda_sigreg: float = 0.02,
+        lambda_sigreg: float = 0.05,
         knots: int = 17,
-        multivariate: bool = True,
+        t_max: float = 3.0,
+        num_slices: int = 1024,
+        clip_value: float | None = None,
+        multivariate: bool = False,
         num_frequencies: int = 256,
         sigma: float = 1.0,
+        num_global_views: int = 2,
     ):
         """
         Args:
             lambda_sigreg: Weight for SIGReg loss (1-lambda for invariance)
-            knots: Number of quadrature points for univariate SIGReg
-            multivariate: If True, use multivariate SIGReg (default)
+            knots: Number of quadrature points for univariate SIGReg (paper uses 17)
+            t_max: Upper integration bound for Epps–Pulley (paper uses 3)
+            num_slices: Number of random 1D slices for univariate SIGReg (paper uses ~1024)
+            clip_value: Optional threshold to zero-out tiny slice statistics
+            multivariate: If True, use multivariate SIGReg (CF variant)
             num_frequencies: Number of frequency vectors for multivariate mode
             sigma: Frequency scale for multivariate mode
+            num_global_views: Number of global views used to form prediction targets (paper uses 2)
         """
         super().__init__()
         self.lambda_sigreg = lambda_sigreg
         self.multivariate = multivariate
+        self.num_global_views = int(num_global_views)
 
         if multivariate:
             self.sigreg = MultivariateSIGReg(
@@ -164,15 +255,28 @@ class LeJEPALoss(nn.Module):
                 sigma=sigma,
             )
         else:
-            self.sigreg = SIGReg(knots=knots)
+            self.sigreg = SIGReg(
+                knots=knots,
+                t_max=t_max,
+                num_slices=num_slices,
+                clip_value=clip_value,
+            )
 
-    def forward(self, proj: torch.Tensor) -> dict[str, torch.Tensor]:
+    def forward(
+        self,
+        proj: torch.Tensor,
+        *,
+        global_proj: torch.Tensor | None = None,
+    ) -> dict[str, torch.Tensor]:
         """
         Compute combined LeJEPA loss.
 
         Args:
             proj: (V, B, proj_dim) projected embeddings from multiple views
                   V = num_views, B = batch_size
+            global_proj: Optional (Vg, B, proj_dim) projections for global views only.
+                         If provided, prediction targets are formed from this tensor
+                         (useful for teacher/SWA targets).
 
         Returns:
             Dictionary with loss components
@@ -180,15 +284,23 @@ class LeJEPALoss(nn.Module):
         # SIGReg loss on projections
         sigreg_loss = self.sigreg(proj)
 
-        # Invariance loss: views should cluster around their mean
-        # proj shape: (V, B, D) -> mean over views, then MSE
-        inv_loss = (proj.mean(0) - proj).square().mean()
+        # Prediction loss (paper): all views predict the global-view centroid
+        # proj shape: (V, B, D); centroid shape: (B, D)
+        if global_proj is None:
+            v_global = min(self.num_global_views, int(proj.size(0)))
+            if v_global <= 0:
+                v_global = int(proj.size(0))
+            centers = proj[:v_global].mean(dim=0)
+        else:
+            centers = global_proj.mean(dim=0)
+
+        pred_loss = (centers - proj).square().mean()
 
         # Combined loss
-        loss = self.lambda_sigreg * sigreg_loss + (1 - self.lambda_sigreg) * inv_loss
+        loss = self.lambda_sigreg * sigreg_loss + (1 - self.lambda_sigreg) * pred_loss
 
         return {
             "loss": loss,
             "sigreg_loss": sigreg_loss,
-            "invariance_loss": inv_loss,
+            "prediction_loss": pred_loss,
         }
