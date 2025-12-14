@@ -27,7 +27,7 @@ class Config:
 
     # Projector
     proj_hidden_dim: int = 2048
-    proj_dim: int = 16  # Reference uses 16
+    proj_dim: int = 64  # Paper ablations show this is a strong default
 
     # Training
     batch_size: int = 256
@@ -48,8 +48,8 @@ class Config:
     # Multi-Crop Parameters
     local_crops_number: int = 6
     local_crops_size: int = 96
-    local_crops_scale: tuple = (0.05, 0.4)
-    global_crops_scale: tuple = (0.4, 1.0)
+    local_crops_scale: tuple = (0.05, 0.3)  # Paper: (0.05, 0.3)
+    global_crops_scale: tuple = (0.3, 1.0)  # Paper: (0.3, 1.0)
 
     # SIGReg parameters
     # Paper default: sliced Epps–Pulley (univariate test) with ~1024 slices.
