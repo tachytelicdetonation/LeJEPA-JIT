@@ -574,7 +574,7 @@ def generate_pocp_per_head_heatmaps(
     if len(panels) == 1:
         axes = [axes]
 
-    for ax, data, title in panels:
+    for ax, (data, title) in zip(axes, panels):
         im = ax.imshow(
             data,
             aspect="auto",
