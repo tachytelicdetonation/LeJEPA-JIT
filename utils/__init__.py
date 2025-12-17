@@ -49,6 +49,11 @@ from utils.visualization import (
     generate_embedding_spectrum,
     generate_xy_curves,
     generate_pocp_per_head_heatmaps,
+    # SIGReg-aligned visualizations
+    generate_isotropy_evolution_plot,
+    generate_loss_accuracy_correlation_plot,
+    generate_embedding_distribution_plot,
+    generate_sigreg_loss_components_plot,
 )
 
 __all__ = [
@@ -89,4 +94,9 @@ __all__ = [
     "generate_xy_curves",
     "generate_pocp_per_head_heatmaps",
     "AttentionTracker",
+    # SIGReg-aligned visualizations
+    "generate_isotropy_evolution_plot",
+    "generate_loss_accuracy_correlation_plot",
+    "generate_embedding_distribution_plot",
+    "generate_sigreg_loss_components_plot",
 ]

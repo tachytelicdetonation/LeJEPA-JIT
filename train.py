@@ -1401,6 +1401,15 @@ def main():
     attn_frames_nette = []
     attn_frames_woof = []
 
+    # History tracking for SIGReg-aligned visualizations
+    isotropy_history = []
+    effective_rank_history = []
+    uniformity_history = []
+    sigreg_loss_history = []
+    invariance_loss_history = []
+    total_loss_history = []
+    accuracy_history = []
+
     # Get a batch from val_loader_nette
     try:
         iter_nette = iter(val_loader_nette)
@@ -1438,6 +1447,11 @@ def main():
         generate_head_ablation_heatmap,
         generate_pocp_per_head_heatmaps,
         AttentionTracker,
+        # SIGReg-aligned visualizations
+        generate_isotropy_evolution_plot,
+        generate_loss_accuracy_correlation_plot,
+        generate_embedding_distribution_plot,
+        generate_sigreg_loss_components_plot,
     )
 
     # Register Backward Hooks for Gradient Flow
@@ -1590,6 +1604,13 @@ def main():
                 f"  Val Acc (Woof): {val_metrics_woof['val_accuracy']:.2f}% (Top-5: {val_metrics_woof.get('val_top5', 0):.2f}%, Loss: {val_metrics_woof.get('val_loss', 0):.4f})"
             )
         print(f"  Time: {epoch_time:.1f}s")
+
+        # Track histories for SIGReg-aligned visualizations
+        sigreg_loss_history.append(train_metrics["sigreg_loss"])
+        invariance_loss_history.append(train_metrics["prediction_loss"])
+        total_loss_history.append(train_metrics["loss"])
+        if val_metrics_nette:
+            accuracy_history.append(val_metrics_nette["val_accuracy"])
 
         if config.use_wandb:
             import wandb
@@ -1907,6 +1928,12 @@ def main():
                         collapse_metrics = compute_feature_collapse_metrics(emb_sample)
                         rep_stats = compute_representation_stats(emb_sample)
                         cov_stats = compute_covariance_metrics(emb_sample)
+
+                        # Track SIGReg-aligned histories
+                        isotropy_history.append(rep_stats.get("isotropy", 0.0))
+                        effective_rank_history.append(collapse_metrics["effective_rank"])
+                        uniformity_history.append(collapse_metrics["uniformity"])
+
                         wandb.log(
                             {
                                 "collapse/avg_similarity": collapse_metrics["avg_similarity"],
@@ -1924,6 +1951,50 @@ def main():
                             },
                             commit=False,
                         )
+
+                        # SIGReg-aligned visualizations (every collapse_monitor_interval)
+                        # 1. Isotropy evolution plot (only if we have enough data points)
+                        if len(isotropy_history) >= 2:
+                            iso_plot = generate_isotropy_evolution_plot(
+                                isotropy_history,
+                                effective_rank_history,
+                                uniformity_history,
+                            )
+                            wandb.log(
+                                {"vis/isotropy_evolution": wandb.Image(iso_plot, caption=f"Epoch {epoch}")},
+                                commit=False,
+                            )
+
+                        # 2. Embedding distribution plot (shows Gaussian fit quality)
+                        emb_dist_plot = generate_embedding_distribution_plot(emb_sample)
+                        wandb.log(
+                            {"vis/embedding_distribution": wandb.Image(emb_dist_plot, caption=f"Epoch {epoch}")},
+                            commit=False,
+                        )
+
+                        # 3. Loss-accuracy correlation (every 10 epochs, need enough data)
+                        if epoch % 10 == 0 and len(total_loss_history) >= 2 and len(accuracy_history) >= 2:
+                            corr_plot = generate_loss_accuracy_correlation_plot(
+                                total_loss_history,
+                                accuracy_history,
+                            )
+                            wandb.log(
+                                {"vis/loss_accuracy_correlation": wandb.Image(corr_plot, caption=f"Epoch {epoch}")},
+                                commit=False,
+                            )
+
+                        # 4. SIGReg loss components plot (every collapse_monitor_interval)
+                        if len(sigreg_loss_history) >= 2:
+                            loss_comp_plot = generate_sigreg_loss_components_plot(
+                                sigreg_loss_history,
+                                invariance_loss_history,
+                                total_loss_history,
+                                lambda_sigreg=config.lambda_sigreg,
+                            )
+                            wandb.log(
+                                {"vis/sigreg_loss_components": wandb.Image(loss_comp_plot, caption=f"Epoch {epoch}")},
+                                commit=False,
+                            )
 
                 # 10b. Block-wise activation diagnostics (token norms + residual ratios + drift)
                 if config.use_wandb and _every_or_first(epoch, config.block_diag_interval):

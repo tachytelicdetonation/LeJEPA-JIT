@@ -2088,3 +2088,378 @@ def generate_training_dashboard(
     plt.close(fig)
 
     return img
+
+
+# =============================================================================
+# SIGReg-Aligned Visualization Functions
+# =============================================================================
+
+
+def generate_isotropy_evolution_plot(
+    isotropy_history: List[float],
+    effective_rank_history: List[float],
+    uniformity_history: List[float],
+    figsize: Tuple[int, int] = (12, 4),
+) -> Image.Image:
+    """
+    Track THE key SIGReg metrics over training.
+
+    Shows:
+    - Isotropy score (min_eig / max_eig) over epochs
+    - Effective rank over epochs
+    - Uniformity loss over epochs
+
+    These metrics directly reflect how well SIGReg is pushing embeddings
+    toward an isotropic Gaussian distribution.
+
+    Args:
+        isotropy_history: List of isotropy scores (min_eig/max_eig)
+        effective_rank_history: List of effective rank values
+        uniformity_history: List of uniformity loss values
+        figsize: Figure size
+
+    Returns:
+        PIL Image with 3-panel plot
+    """
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+    epochs = range(1, len(isotropy_history) + 1) if isotropy_history else []
+
+    # Panel 1: Isotropy
+    ax1 = axes[0]
+    if isotropy_history:
+        ax1.plot(epochs, isotropy_history, "b-", linewidth=2, marker="o", markersize=3)
+        ax1.axhline(y=0.1, color="r", linestyle="--", alpha=0.5, label="Healthy threshold")
+        ax1.fill_between(epochs, 0, isotropy_history, alpha=0.2)
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Isotropy (min_eig / max_eig)")
+    ax1.set_title("Isotropy Score (↑ = more isotropic)")
+    ax1.set_ylim(0, 1)
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc="lower right", fontsize=8)
+
+    # Panel 2: Effective Rank
+    ax2 = axes[1]
+    if effective_rank_history:
+        epochs2 = range(1, len(effective_rank_history) + 1)
+        ax2.plot(epochs2, effective_rank_history, "g-", linewidth=2, marker="o", markersize=3)
+        ax2.fill_between(epochs2, 0, effective_rank_history, alpha=0.2, color="green")
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Effective Rank")
+    ax2.set_title("Effective Rank (↑ = less collapse)")
+    ax2.grid(True, alpha=0.3)
+
+    # Panel 3: Uniformity
+    ax3 = axes[2]
+    if uniformity_history:
+        epochs3 = range(1, len(uniformity_history) + 1)
+        ax3.plot(epochs3, uniformity_history, "purple", linewidth=2, marker="o", markersize=3)
+        ax3.axhline(y=0, color="gray", linestyle="--", alpha=0.5, label="Target (uniform)")
+    ax3.set_xlabel("Epoch")
+    ax3.set_ylabel("Uniformity Loss")
+    ax3.set_title("Uniformity (↓ = more uniform)")
+    ax3.grid(True, alpha=0.3)
+    if uniformity_history:
+        ax3.legend(loc="upper right", fontsize=8)
+
+    plt.suptitle("SIGReg Isotropy Evolution", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+
+    img = _fig_to_pil(fig)
+    plt.close(fig)
+    return img
+
+
+def generate_loss_accuracy_correlation_plot(
+    loss_history: List[float],
+    accuracy_history: List[float],
+    figsize: Tuple[int, int] = (10, 4),
+) -> Image.Image:
+    """
+    Validate LeJEPA's key finding: training loss correlates with linear probe accuracy.
+
+    If strong correlation, loss alone can guide model selection without expensive probing.
+
+    Args:
+        loss_history: List of training loss values per epoch
+        accuracy_history: List of kNN/linear probe accuracy values per epoch
+        figsize: Figure size
+
+    Returns:
+        PIL Image with scatter plot and correlation coefficient
+    """
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    # Align histories to same length
+    min_len = min(len(loss_history), len(accuracy_history))
+    if min_len < 2:
+        ax = axes[0]
+        ax.text(0.5, 0.5, "Insufficient data\n(need >= 2 epochs)", ha="center", va="center")
+        ax.axis("off")
+        axes[1].axis("off")
+        plt.tight_layout()
+        img = _fig_to_pil(fig)
+        plt.close(fig)
+        return img
+
+    losses = np.array(loss_history[:min_len])
+    accuracies = np.array(accuracy_history[:min_len])
+
+    # Panel 1: Scatter plot with trend line
+    ax1 = axes[0]
+    ax1.scatter(losses, accuracies, c=range(min_len), cmap="viridis", s=50, alpha=0.7)
+
+    # Add trend line
+    z = np.polyfit(losses, accuracies, 1)
+    p = np.poly1d(z)
+    x_line = np.linspace(losses.min(), losses.max(), 100)
+    ax1.plot(x_line, p(x_line), "r--", linewidth=2, label="Trend")
+
+    # Compute Pearson correlation
+    corr = np.corrcoef(losses, accuracies)[0, 1]
+    ax1.set_xlabel("Training Loss")
+    ax1.set_ylabel("Accuracy (%)")
+    ax1.set_title(f"Loss vs Accuracy (r = {corr:.3f})")
+    ax1.grid(True, alpha=0.3)
+    ax1.legend()
+
+    # Colorbar for epoch
+    sm = plt.cm.ScalarMappable(cmap="viridis", norm=plt.Normalize(1, min_len))
+    sm.set_array([])
+    cbar = plt.colorbar(sm, ax=ax1)
+    cbar.set_label("Epoch")
+
+    # Panel 2: Time series overlay
+    ax2 = axes[1]
+    epochs = range(1, min_len + 1)
+    ax2.plot(epochs, losses / losses.max(), "b-", linewidth=2, label="Loss (normalized)")
+    ax2.plot(epochs, accuracies / 100, "g-", linewidth=2, label="Accuracy (normalized)")
+    ax2.set_xlabel("Epoch")
+    ax2.set_ylabel("Normalized Value")
+    ax2.set_title("Loss and Accuracy Over Time")
+    ax2.grid(True, alpha=0.3)
+    ax2.legend()
+
+    # Add correlation interpretation
+    if abs(corr) > 0.8:
+        corr_text = "Strong correlation"
+    elif abs(corr) > 0.5:
+        corr_text = "Moderate correlation"
+    else:
+        corr_text = "Weak correlation"
+
+    plt.suptitle(
+        f"LeJEPA Loss-Accuracy Correlation: {corr_text}",
+        fontsize=14,
+        fontweight="bold",
+    )
+    plt.tight_layout()
+
+    img = _fig_to_pil(fig)
+    plt.close(fig)
+    return img
+
+
+@torch.no_grad()
+def generate_embedding_distribution_plot(
+    embeddings: torch.Tensor,
+    figsize: Tuple[int, int] = (12, 10),
+) -> Image.Image:
+    """
+    Visualize if embeddings match isotropic Gaussian (SIGReg target).
+
+    2x2 panel showing:
+    1. Histogram of embedding norms vs chi distribution
+    2. Q-Q plot vs Gaussian (first principal component)
+    3. Per-dimension variance histogram (should be uniform)
+    4. Off-diagonal correlation heatmap (should be near-zero)
+
+    Args:
+        embeddings: (N, D) tensor of embeddings
+        figsize: Figure size
+
+    Returns:
+        PIL Image with 2x2 diagnostic panel
+    """
+    from scipy import stats
+
+    z = embeddings.detach().float().cpu()
+    if z.ndim != 2 or z.size(0) < 10:
+        fig, ax = plt.subplots(figsize=(8, 6))
+        ax.text(0.5, 0.5, "Insufficient embeddings\n(need >= 10 samples)", ha="center", va="center")
+        ax.axis("off")
+        img = _fig_to_pil(fig)
+        plt.close(fig)
+        return img
+
+    N, D = z.shape
+    z_centered = z - z.mean(dim=0, keepdim=True)
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+
+    # Panel 1: Embedding norms vs chi distribution
+    ax1 = axes[0, 0]
+    norms = z_centered.norm(dim=1).numpy()
+    ax1.hist(norms, bins=30, density=True, alpha=0.7, color="blue", label="Empirical")
+
+    # Chi distribution with D degrees of freedom (for isotropic Gaussian)
+    x_chi = np.linspace(0, norms.max() * 1.1, 100)
+    # For standard Gaussian, ||z|| ~ chi(D), scaled by sqrt of variance
+    var_per_dim = z_centered.var(dim=0).mean().item()
+    chi_pdf = stats.chi.pdf(x_chi / np.sqrt(var_per_dim), df=D) / np.sqrt(var_per_dim)
+    ax1.plot(x_chi, chi_pdf, "r-", linewidth=2, label=f"Chi({D}) theory")
+    ax1.set_xlabel("Embedding Norm")
+    ax1.set_ylabel("Density")
+    ax1.set_title("Norm Distribution vs Chi")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # Panel 2: Q-Q plot of first PC vs Gaussian
+    ax2 = axes[0, 1]
+    # PCA to get first component
+    cov = (z_centered.T @ z_centered) / (N - 1)
+    try:
+        eigvals, eigvecs = torch.linalg.eigh(cov)
+        pc1 = (z_centered @ eigvecs[:, -1]).numpy()  # Largest eigenvector
+        stats.probplot(pc1, dist="norm", plot=ax2)
+        ax2.set_title("Q-Q Plot (1st PC vs Gaussian)")
+    except Exception:
+        ax2.text(0.5, 0.5, "Q-Q plot failed", ha="center", va="center")
+        ax2.axis("off")
+
+    # Panel 3: Per-dimension variance histogram
+    ax3 = axes[1, 0]
+    per_dim_var = z_centered.var(dim=0).numpy()
+    ax3.hist(per_dim_var, bins=30, alpha=0.7, color="green")
+    ax3.axvline(per_dim_var.mean(), color="red", linestyle="--", linewidth=2, label=f"Mean={per_dim_var.mean():.3f}")
+    # For isotropic, all variances should be equal
+    cv = per_dim_var.std() / (per_dim_var.mean() + 1e-8)
+    ax3.set_xlabel("Variance")
+    ax3.set_ylabel("Count")
+    ax3.set_title(f"Per-Dimension Variance (CV={cv:.3f})")
+    ax3.legend()
+    ax3.grid(True, alpha=0.3)
+
+    # Panel 4: Off-diagonal correlation heatmap (subsample dims for visibility)
+    ax4 = axes[1, 1]
+    max_dims_show = 64
+    if D > max_dims_show:
+        idx = np.linspace(0, D - 1, max_dims_show, dtype=int)
+        z_sub = z_centered[:, idx]
+    else:
+        z_sub = z_centered
+
+    corr_matrix = np.corrcoef(z_sub.T)
+    # Mask diagonal
+    np.fill_diagonal(corr_matrix, np.nan)
+    im = ax4.imshow(corr_matrix, cmap="RdBu_r", vmin=-1, vmax=1, aspect="auto")
+    plt.colorbar(im, ax=ax4, label="Correlation")
+    ax4.set_title("Off-Diagonal Correlations (should be ~0)")
+    ax4.set_xlabel("Dimension")
+    ax4.set_ylabel("Dimension")
+
+    # Compute mean absolute off-diagonal correlation
+    mask = ~np.isnan(corr_matrix)
+    mean_abs_corr = np.abs(corr_matrix[mask]).mean()
+
+    plt.suptitle(
+        f"Embedding Distribution Analysis (Mean |corr|={mean_abs_corr:.4f})",
+        fontsize=14,
+        fontweight="bold",
+    )
+    plt.tight_layout()
+
+    img = _fig_to_pil(fig)
+    plt.close(fig)
+    return img
+
+
+def generate_sigreg_loss_components_plot(
+    sigreg_history: List[float],
+    invariance_history: List[float],
+    total_history: List[float],
+    lambda_sigreg: float = 0.05,
+    figsize: Tuple[int, int] = (12, 4),
+) -> Image.Image:
+    """
+    Track SIGReg loss component breakdown over training.
+
+    Shows the balance between regularization (SIGReg) and prediction (invariance).
+
+    Args:
+        sigreg_history: List of SIGReg loss values per epoch
+        invariance_history: List of invariance/prediction loss values per epoch
+        total_history: List of total combined loss values per epoch
+        lambda_sigreg: Weight used for SIGReg in combined loss
+        figsize: Figure size
+
+    Returns:
+        PIL Image with loss component visualization
+    """
+    fig, axes = plt.subplots(1, 3, figsize=figsize)
+
+    epochs = range(1, len(total_history) + 1) if total_history else []
+
+    # Panel 1: Raw loss components
+    ax1 = axes[0]
+    if sigreg_history:
+        epochs_sig = range(1, len(sigreg_history) + 1)
+        ax1.plot(epochs_sig, sigreg_history, "b-", linewidth=2, label="SIGReg", marker="o", markersize=3)
+    if invariance_history:
+        epochs_inv = range(1, len(invariance_history) + 1)
+        ax1.plot(epochs_inv, invariance_history, "g-", linewidth=2, label="Invariance", marker="s", markersize=3)
+    ax1.set_xlabel("Epoch")
+    ax1.set_ylabel("Loss Value")
+    ax1.set_title("Raw Loss Components")
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+
+    # Panel 2: Weighted contributions
+    ax2 = axes[1]
+    if sigreg_history and invariance_history:
+        min_len = min(len(sigreg_history), len(invariance_history))
+        epochs_w = range(1, min_len + 1)
+        weighted_sigreg = [s * lambda_sigreg for s in sigreg_history[:min_len]]
+        weighted_inv = [i * (1 - lambda_sigreg) for i in invariance_history[:min_len]]
+        ax2.stackplot(
+            epochs_w,
+            weighted_sigreg,
+            weighted_inv,
+            labels=[f"SIGReg (λ={lambda_sigreg})", f"Invariance (1-λ={1-lambda_sigreg})"],
+            colors=["blue", "green"],
+            alpha=0.7,
+        )
+        ax2.set_xlabel("Epoch")
+        ax2.set_ylabel("Weighted Loss")
+        ax2.set_title("Weighted Loss Contributions (Stacked)")
+        ax2.legend(loc="upper right")
+        ax2.grid(True, alpha=0.3)
+
+    # Panel 3: Total loss with component ratio
+    ax3 = axes[2]
+    if total_history:
+        ax3.plot(epochs, total_history, "r-", linewidth=2, marker="^", markersize=3, label="Total Loss")
+        ax3.set_xlabel("Epoch")
+        ax3.set_ylabel("Total Loss")
+        ax3.set_title("Combined Loss")
+        ax3.grid(True, alpha=0.3)
+        ax3.legend()
+
+        # Add ratio as secondary axis if we have both components
+        if sigreg_history and invariance_history:
+            ax3_twin = ax3.twinx()
+            min_len = min(len(sigreg_history), len(invariance_history))
+            ratios = [
+                sigreg_history[i] / (invariance_history[i] + 1e-8)
+                for i in range(min_len)
+            ]
+            ax3_twin.plot(range(1, min_len + 1), ratios, "purple", linestyle="--", alpha=0.7, label="SIG/Inv ratio")
+            ax3_twin.set_ylabel("SIGReg/Invariance Ratio", color="purple")
+            ax3_twin.tick_params(axis="y", labelcolor="purple")
+
+    plt.suptitle("SIGReg Loss Component Analysis", fontsize=14, fontweight="bold")
+    plt.tight_layout()
+
+    img = _fig_to_pil(fig)
+    plt.close(fig)
+    return img

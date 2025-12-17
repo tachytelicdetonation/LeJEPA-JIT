@@ -105,11 +105,11 @@ class Config:
     embedding_pca_scatter_interval: int = 10  # class separation trend (stable)
 
     # Attention/representation visuals (moderately expensive)
-    layer_attention_interval: int = 10
-    per_head_attention_interval: int = 25
-    token_similarity_interval: int = 25
+    layer_attention_interval: int = 25
+    per_head_attention_interval: int = 50
+    token_similarity_interval: int = 50
     rsm_interval: int = 50
-    collapse_monitor_interval: int = 10
+    collapse_monitor_interval: int = 5
     gradient_flow_interval: int = 10
     drift_interval: int = 5
 
@@ -157,9 +157,9 @@ class Config:
     pocp_freq_planes: int = 32
     attn_logits_interval: int = 5
     mlp_output_stats_interval: int = 5
-    head_ablation_interval: int = 50
+    head_ablation_interval: int = 0
     head_ablation_layers: int = 1  # number of last layers to ablate
-    landscape2d_interval: int = 50
+    landscape2d_interval: int = 100
     landscape2d_radius: float = 0.05
     landscape2d_points: int = 11
 
