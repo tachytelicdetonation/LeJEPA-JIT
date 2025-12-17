@@ -14,6 +14,8 @@ from attention_analysis.visualization.comparison import (
     compare_methods_visual,
     plot_faithfulness_curves,
     plot_entropy_evolution,
+    plot_head_importance,
+    plot_head_similarity,
 )
 
 __all__ = [
@@ -26,4 +28,6 @@ __all__ = [
     "compare_methods_visual",
     "plot_faithfulness_curves",
     "plot_entropy_evolution",
+    "plot_head_importance",
+    "plot_head_similarity",
 ]
