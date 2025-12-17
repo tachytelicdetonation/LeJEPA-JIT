@@ -95,10 +95,18 @@ class Config:
     attn_rollout_interval: int = 5  # attention rollout overlay
 
     # Redundant/optional visuals (disabled by default; enable when investigating)
-    attn_grid_interval: int = 0  # raw last-layer attention (often redundant with rollout)
-    head_importance_interval: int = 0  # older entropy/max/variance heatmap (replaced by per-head entropy)
-    attention_difference_interval: int = 0  # epoch-to-epoch diff tracker (assumes CLS; can be noisy)
-    training_dashboard_interval: int = 0  # WandB already plots scalars; image is redundant
+    attn_grid_interval: int = (
+        0  # raw last-layer attention (often redundant with rollout)
+    )
+    head_importance_interval: int = (
+        0  # older entropy/max/variance heatmap (replaced by per-head entropy)
+    )
+    attention_difference_interval: int = (
+        0  # epoch-to-epoch diff tracker (assumes CLS; can be noisy)
+    )
+    training_dashboard_interval: int = (
+        0  # WandB already plots scalars; image is redundant
+    )
     embedding_projection_interval: int = 0  # t-SNE/UMAP (expensive + noisy)
 
     # Embedding-space visuals for benchmarking
@@ -162,6 +170,37 @@ class Config:
     landscape2d_interval: int = 100
     landscape2d_radius: float = 0.05
     landscape2d_points: int = 11
+
+    # =============================================================================
+    # Attention Analysis Module (new unified attribution methods)
+    # =============================================================================
+
+    # Enable attention analysis callback (logs to WandB automatically)
+    attention_analysis_enabled: bool = True
+
+    # Attribution methods to compute and log
+    # Available: "attn_lrp", "grad_cam", "rollout", "gmar", "raw_attention"
+    attribution_methods: tuple = ("rollout", "gmar", "raw_attention")
+
+    # Attribution visualization interval (epochs)
+    attribution_vis_interval: int = 10
+
+    # Faithfulness evaluation (iAUC, dAUC) - expensive but informative
+    faithfulness_eval_enabled: bool = True
+    faithfulness_eval_interval: int = 25  # epochs
+    faithfulness_num_steps: int = 50  # steps for insertion/deletion curves
+    faithfulness_num_samples: int = 16  # images to evaluate
+
+    # Entropy tracking during training
+    entropy_tracking_enabled: bool = True
+    entropy_log_interval: int = 100  # batches
+
+    # Head specialization analysis
+    head_specialization_enabled: bool = True
+    head_specialization_interval: int = 10  # epochs
+
+    # Number of probe images for consistent attribution tracking
+    attribution_probe_size: int = 8
 
     # Seed
     seed: int = 42

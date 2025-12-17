@@ -522,7 +522,9 @@ def compute_attention_distance_metrics(
 
     # Locality mass: fraction of attention within radius (in patch grid distance)
     mask = (dist <= float(radius)).float()  # (P,P)
-    local_mass_bh = (a * mask.view(1, 1, num_patches, num_patches)).sum(dim=-1).mean(dim=-1)  # (B,H)
+    local_mass_bh = (
+        (a * mask.view(1, 1, num_patches, num_patches)).sum(dim=-1).mean(dim=-1)
+    )  # (B,H)
     local_mass_per_head = local_mass_bh.mean(dim=0)  # (H,)
     local_mass = local_mass_per_head.mean().item()  # avg over heads
 
@@ -600,7 +602,9 @@ def compute_encoder_block_opt_stats(
 
 
 @torch.no_grad()
-def estimate_intrinsic_dim_twonn(embeddings: torch.Tensor, epsilon: float = 1e-12) -> float:
+def estimate_intrinsic_dim_twonn(
+    embeddings: torch.Tensor, epsilon: float = 1e-12
+) -> float:
     """
     TwoNN intrinsic dimension estimator (Facco et al., 2017).
 
@@ -781,7 +785,9 @@ def compute_global_norms(model: nn.Module, epsilon: float = 1e-12) -> dict:
 
 
 @torch.no_grad()
-def compute_linear_cka(x: torch.Tensor, y: torch.Tensor, epsilon: float = 1e-12) -> float:
+def compute_linear_cka(
+    x: torch.Tensor, y: torch.Tensor, epsilon: float = 1e-12
+) -> float:
     """
     Compute linear CKA between two feature matrices.
 
@@ -818,6 +824,7 @@ def compute_linear_cka(x: torch.Tensor, y: torch.Tensor, epsilon: float = 1e-12)
 
     denom = (norm_x * norm_y).clamp(min=epsilon)
     return (hsic / denom).item()
+
 
 def compute_feature_collapse_metrics(embeddings: torch.Tensor) -> dict:
     """

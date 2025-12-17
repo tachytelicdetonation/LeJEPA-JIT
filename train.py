@@ -58,6 +58,18 @@ from utils.metrics import (
     estimate_intrinsic_dim_twonn,
 )
 
+# Attention Analysis Module
+from attention_analysis import (
+    get_attribution,
+    compute_faithfulness_metrics,
+    AttentionEntropyTracker,
+    HeadSpecializationTracker,
+)
+from attention_analysis.visualization import (
+    compare_methods_visual,
+    plot_head_importance,
+)
+
 
 def _cosine_ema_coeff(
     base: float, final: float, epoch: int, total_epochs: int
@@ -143,6 +155,7 @@ def train_one_epoch(
     config: Config,
     scaler: GradScaler,
     attn_grads: list,
+    entropy_tracker: AttentionEntropyTracker | None = None,
 ) -> dict:
     """Train for one epoch."""
     model.train()
@@ -564,6 +577,26 @@ def train_one_epoch(
                         **block_opt_metrics,
                     }
                 )
+
+                # Attention Analysis Module - Batch-level entropy tracking
+                if entropy_tracker is not None:
+                    entropy_snap = entropy_tracker.step(
+                        images=global_crops_tensor[:, 0],  # First global view
+                        epoch=epoch,
+                    )
+                    if entropy_snap is not None:
+                        entropy_metrics = {
+                            "attn_analysis/entropy_mean": entropy_snap.mean_entropy,
+                            "attn_analysis/entropy_std": entropy_snap.std_entropy,
+                        }
+                        # Per-layer entropy
+                        for layer_idx, layer_ent in enumerate(
+                            entropy_snap.layer_entropies
+                        ):
+                            entropy_metrics[
+                                f"attn_analysis/entropy_layer_{layer_idx}"
+                            ] = layer_ent
+                        wandb.log(entropy_metrics, commit=False)
         else:
             prev_iter_end = time.perf_counter()
 
@@ -746,7 +779,7 @@ def _compute_training_loss_from_crops(
 
     global_crops = crops[:2]
     local_crops = crops[2:]
-    B = labels.shape[0]
+    _B = labels.shape[0]  # noqa: F841 (unused, kept for reference)
 
     with _autocast_ctx(device, enabled=mixed_precision):
         global_crops_tensor = torch.stack(global_crops, dim=1)  # (B,2,C,H,W)
@@ -1046,17 +1079,17 @@ def _loss_landscape_slice(
     with torch.no_grad():
         for a in alphas:
             _set_params(gdir, float(a))
-            l, _ = _compute_training_loss_from_crops(
+            loss_val, _ = _compute_training_loss_from_crops(
                 model, probe, loss_fn, crops, labels, device, mixed_precision
             )
-            losses_grad.append(float(l.detach().item()))
+            losses_grad.append(float(loss_val.detach().item()))
 
         for a in alphas:
             _set_params(rdir, float(a))
-            l, _ = _compute_training_loss_from_crops(
+            loss_val, _ = _compute_training_loss_from_crops(
                 model, probe, loss_fn, crops, labels, device, mixed_precision
             )
-            losses_rand.append(float(l.detach().item()))
+            losses_rand.append(float(loss_val.detach().item()))
 
     # Restore
     with torch.no_grad():
@@ -1113,10 +1146,10 @@ def _head_ablation_sensitivity(
             m = torch.ones(num_heads, device=device, dtype=torch.float32)
             m[hi] = 0.0
             attn.head_mask = m
-            l, _ = _compute_training_loss_from_crops(
+            loss_val, _ = _compute_training_loss_from_crops(
                 model, probe, loss_fn, crops, labels, device, mixed_precision
             )
-            row.append(float(l.detach().item()) - base)
+            row.append(float(loss_val.detach().item()) - base)
         attn.head_mask = orig_mask
         delta.append(row)
 
@@ -1263,6 +1296,10 @@ def main():
                 wandb.define_metric("epoch_opt/*", step_metric="epoch")
                 wandb.define_metric("gns/*", step_metric="epoch")
                 wandb.define_metric("sharpness/*", step_metric="epoch")
+                # Attention Analysis Module metrics
+                wandb.define_metric("attribution/*", step_metric="epoch")
+                wandb.define_metric("faithfulness/*", step_metric="epoch")
+                wandb.define_metric("entropy/*", step_metric="step")
         except ImportError:
             print("wandb not installed, skipping logging")
             config.use_wandb = False
@@ -1437,6 +1474,60 @@ def main():
         generate_sigreg_loss_components_plot,
     )
 
+    # ==========================================================================
+    # Initialize Attention Analysis Module
+    # ==========================================================================
+    entropy_tracker = None
+    head_tracker = None
+    attribution_probe_images = None
+    attribution_probe_labels = None
+
+    if config.attention_analysis_enabled:
+        print("\nInitializing Attention Analysis Module...")
+
+        # Get probe images for consistent attribution tracking
+        try:
+            iter_probe = iter(val_loader_nette)
+            probe_batch, probe_labels_batch = next(iter_probe)
+            attribution_probe_images = probe_batch[
+                : config.attribution_probe_size, 0
+            ].to(device)
+            attribution_probe_labels = probe_labels_batch[
+                : config.attribution_probe_size
+            ].to(device)
+            print(f"  - Probe images: {attribution_probe_images.shape}")
+        except StopIteration:
+            print("  - Warning: Could not get probe images for attribution")
+
+        # Initialize entropy tracker
+        if config.entropy_tracking_enabled:
+            entropy_tracker = AttentionEntropyTracker(
+                model,
+                log_interval=config.entropy_log_interval,
+                probe_images=attribution_probe_images,
+            )
+            print(
+                f"  - Entropy tracker: log every {config.entropy_log_interval} batches"
+            )
+
+        # Initialize head specialization tracker
+        if config.head_specialization_enabled:
+            head_tracker = HeadSpecializationTracker(
+                model,
+                probe_images=attribution_probe_images,
+                probe_labels=attribution_probe_labels,
+            )
+            print(
+                f"  - Head tracker: analyze every {config.head_specialization_interval} epochs"
+            )
+
+        print(f"  - Attribution methods: {config.attribution_methods}")
+        print(f"  - Attribution vis interval: {config.attribution_vis_interval} epochs")
+        if config.faithfulness_eval_enabled:
+            print(
+                f"  - Faithfulness eval: every {config.faithfulness_eval_interval} epochs"
+            )
+
     # Register Backward Hooks for Gradient Flow
     attn_grads = []
 
@@ -1485,6 +1576,7 @@ def main():
             config=config,
             scaler=scaler,
             attn_grads=attn_grads,
+            entropy_tracker=entropy_tracker,
         )
 
         # Evaluate
@@ -3079,6 +3171,160 @@ def main():
                             )
                     except Exception as e:
                         print(f"Head ablation diagnostics failed: {e}")
+
+                # ==============================================================
+                # Attention Analysis Module - Epoch-level logging
+                # ==============================================================
+                if (
+                    config.attention_analysis_enabled
+                    and attribution_probe_images is not None
+                ):
+                    try:
+                        # Attribution visualization
+                        if _every_or_first(epoch, config.attribution_vis_interval):
+                            method_attrs = {}
+                            for method_name in config.attribution_methods:
+                                try:
+                                    # Compute attribution for first probe image
+                                    attr = get_attribution(
+                                        model,
+                                        attribution_probe_images[0:1],
+                                        method=method_name,
+                                        target_class=int(
+                                            attribution_probe_labels[0].item()
+                                        ),
+                                    )
+                                    method_attrs[method_name] = attr
+
+                                    # Log individual attribution heatmap
+                                    from attention_analysis.visualization.heatmaps import (
+                                        overlay_attribution,
+                                    )
+
+                                    overlay = overlay_attribution(
+                                        attribution_probe_images[0],
+                                        attr,
+                                        alpha=0.5,
+                                    )
+                                    wandb.log(
+                                        {
+                                            f"attribution/{method_name}": wandb.Image(
+                                                overlay, caption=f"Epoch {epoch}"
+                                            )
+                                        },
+                                        commit=False,
+                                    )
+                                except Exception as e:
+                                    print(f"  Attribution {method_name} failed: {e}")
+
+                            # Log comparison visualization
+                            if len(method_attrs) > 1:
+                                try:
+                                    comparison = compare_methods_visual(
+                                        attribution_probe_images[0],
+                                        method_attrs,
+                                    )
+                                    wandb.log(
+                                        {
+                                            "attribution/comparison": wandb.Image(
+                                                comparison, caption=f"Epoch {epoch}"
+                                            )
+                                        },
+                                        commit=False,
+                                    )
+                                except Exception as e:
+                                    print(f"  Attribution comparison failed: {e}")
+
+                        # Head specialization analysis
+                        if (
+                            config.head_specialization_enabled
+                            and head_tracker is not None
+                            and _every_or_first(
+                                epoch, config.head_specialization_interval
+                            )
+                        ):
+                            try:
+                                importance = head_tracker.compute_head_importance(
+                                    method="activation"
+                                )
+                                if importance:
+                                    importance_img = plot_head_importance(
+                                        importance,
+                                        title=f"Head Importance (Epoch {epoch})",
+                                    )
+                                    wandb.log(
+                                        {
+                                            "attention/head_importance": wandb.Image(
+                                                importance_img, caption=f"Epoch {epoch}"
+                                            )
+                                        },
+                                        commit=False,
+                                    )
+                            except Exception as e:
+                                print(f"  Head importance failed: {e}")
+
+                        # Faithfulness evaluation (expensive)
+                        if config.faithfulness_eval_enabled and _every_or_first(
+                            epoch, config.faithfulness_eval_interval
+                        ):
+                            try:
+                                # Compute attributions for evaluation
+                                eval_images = attribution_probe_images[
+                                    : config.faithfulness_num_samples
+                                ]
+                                eval_labels = attribution_probe_labels[
+                                    : config.faithfulness_num_samples
+                                ]
+
+                                for method_name in config.attribution_methods[
+                                    :2
+                                ]:  # Limit to 2 for speed
+                                    attrs = []
+                                    for i in range(len(eval_images)):
+                                        try:
+                                            attr = get_attribution(
+                                                model,
+                                                eval_images[i : i + 1],
+                                                method=method_name,
+                                                target_class=int(eval_labels[i].item()),
+                                            )
+                                            attrs.append(attr)
+                                        except Exception:
+                                            continue
+
+                                    if attrs:
+                                        attrs_tensor = torch.stack(attrs)
+                                        faith_result = compute_faithfulness_metrics(
+                                            model,
+                                            eval_images[: len(attrs)],
+                                            attrs_tensor,
+                                            target_classes=[
+                                                int(lbl.item())
+                                                for lbl in eval_labels[: len(attrs)]
+                                            ],
+                                            num_steps=config.faithfulness_num_steps,
+                                            show_progress=False,
+                                        )
+
+                                        wandb.log(
+                                            {
+                                                f"faithfulness/{method_name}_insertion_auc": faith_result[
+                                                    "mean_insertion_auc"
+                                                ],
+                                                f"faithfulness/{method_name}_deletion_auc": faith_result[
+                                                    "mean_deletion_auc"
+                                                ],
+                                                f"faithfulness/{method_name}_combined": faith_result[
+                                                    "mean_combined"
+                                                ],
+                                            },
+                                            commit=False,
+                                        )
+                            except Exception as e:
+                                print(f"  Faithfulness eval failed: {e}")
+
+                    except Exception as e:
+                        print(f"Attention analysis failed: {e}")
 
             except Exception as e:
                 print(f"Error generating visualization: {e}")

@@ -239,7 +239,11 @@ def _compute_pocp_stats(
 
     # For vision, optionally ignore CLS (token 0) if the layout matches (grid^2 + 1).
     start = 0
-    if grid_size is not None and int(grid_size) > 0 and N == int(grid_size) * int(grid_size) + 1:
+    if (
+        grid_size is not None
+        and int(grid_size) > 0
+        and N == int(grid_size) * int(grid_size) + 1
+    ):
         start = 1
 
     P = N - start
@@ -293,7 +297,11 @@ def _compute_pocp_stats(
     dist_edges: Optional[list[float]] = None
 
     if num_distance_bins > 0:
-        if grid_size is not None and int(grid_size) > 0 and P == int(grid_size) * int(grid_size):
+        if (
+            grid_size is not None
+            and int(grid_size) > 0
+            and P == int(grid_size) * int(grid_size)
+        ):
             g = int(grid_size)
             ri = idx_i // g
             ci = idx_i % g
@@ -327,12 +335,8 @@ def _compute_pocp_stats(
             m = (dist > lo) & (dist <= hi)
             if bool(m.any()):
                 pocp_curve.append(float(pocp_pair[:, :, m].mean().item()))
-                pocp_high_curve.append(
-                    float(obtuse[:, :, m, :k_planes].mean().item())
-                )
-                pocp_low_curve.append(
-                    float(obtuse[:, :, m, -k_planes:].mean().item())
-                )
+                pocp_high_curve.append(float(obtuse[:, :, m, :k_planes].mean().item()))
+                pocp_low_curve.append(float(obtuse[:, :, m, -k_planes:].mean().item()))
                 qk_curve.append(float(qk_dot[:, :, m].mean().item()))
             else:
                 pocp_curve.append(float("nan"))

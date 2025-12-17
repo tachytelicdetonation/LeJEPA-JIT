@@ -268,7 +268,9 @@ def evaluate_model(
     )
 
     print("Extracting validation features...")
-    val_features, val_labels = extract_features(model, val_loader, device, mixed_precision=True)
+    val_features, val_labels = extract_features(
+        model, val_loader, device, mixed_precision=True
+    )
 
     print(f"Train features shape: {train_features.shape}")
     print(f"Val features shape: {val_features.shape}")

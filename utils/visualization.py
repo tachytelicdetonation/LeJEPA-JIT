@@ -479,12 +479,12 @@ def generate_attention_distance_per_head_heatmap_from_maps(
 
     for li, attn in enumerate(attentions):
         m = compute_attention_distance_metrics(attn, grid_size=grid_size, radius=radius)
-        d = m.get("patch_attn_distance_per_head", [0.0] * num_heads)
-        l = m.get("patch_local_mass_r1_per_head", [0.0] * num_heads)
-        if len(d) == num_heads:
-            dist_map[li, :] = np.asarray(d, dtype=np.float32)
-        if len(l) == num_heads:
-            local_map[li, :] = np.asarray(l, dtype=np.float32)
+        dist_per_head = m.get("patch_attn_distance_per_head", [0.0] * num_heads)
+        local_mass = m.get("patch_local_mass_r1_per_head", [0.0] * num_heads)
+        if len(dist_per_head) == num_heads:
+            dist_map[li, :] = np.asarray(dist_per_head, dtype=np.float32)
+        if len(local_mass) == num_heads:
+            local_map[li, :] = np.asarray(local_mass, dtype=np.float32)
 
     fig, axes = plt.subplots(1, 2, figsize=figsize)
 
