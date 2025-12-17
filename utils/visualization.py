@@ -46,7 +46,9 @@ def _fig_to_pil(fig) -> Image.Image:
         return Image.fromarray(buf[..., :3], mode="RGB")
 
     # Fallback for older Matplotlib
-    return Image.frombytes("RGB", fig.canvas.get_width_height(), fig.canvas.tostring_rgb())
+    return Image.frombytes(
+        "RGB", fig.canvas.get_width_height(), fig.canvas.tostring_rgb()
+    )
 
 
 @torch.no_grad()
@@ -220,6 +222,227 @@ def generate_loss_landscape_2d(
     pil = _fig_to_pil(fig)
     plt.close(fig)
     return pil
+
+
+def generate_loss_landscape_contour(
+    alphas: List[float],
+    betas: List[float],
+    losses_grid: List[List[float]],
+    title: str,
+    levels: int = 30,
+    cmap: str = "coolwarm",
+) -> Image.Image:
+    """
+    Publication-quality contour plot with level lines.
+
+    Args:
+        alphas: X-axis values (direction 1 coefficients)
+        betas: Y-axis values (direction 2 coefficients)
+        losses_grid: 2D grid of loss values
+        title: Plot title
+        levels: Number of contour levels
+        cmap: Colormap name
+
+    Returns:
+        PIL Image of the contour plot
+    """
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.set_title(title, fontsize=14)
+
+    if not alphas or not betas or not losses_grid:
+        ax.text(0.5, 0.5, "No data", ha="center", va="center")
+        ax.axis("off")
+        pil = _fig_to_pil(fig)
+        plt.close(fig)
+        return pil
+
+    X, Y = np.meshgrid(alphas, betas)
+    Z = np.asarray(losses_grid, dtype=np.float32)
+
+    # Filled contours
+    cf = ax.contourf(X, Y, Z, levels=levels, cmap=cmap)
+    # Contour lines with labels
+    cs = ax.contour(
+        X, Y, Z, levels=max(levels // 3, 5), colors="k", linewidths=0.5, alpha=0.5
+    )
+    ax.clabel(cs, inline=True, fontsize=8, fmt="%.2f")
+
+    plt.colorbar(cf, ax=ax, label="Loss")
+    ax.set_xlabel("Direction 1 (α)", fontsize=12)
+    ax.set_ylabel("Direction 2 (β)", fontsize=12)
+    ax.set_aspect("equal")
+    plt.tight_layout()
+
+    pil = _fig_to_pil(fig)
+    plt.close(fig)
+    return pil
+
+
+def generate_loss_landscape_3d(
+    alphas: List[float],
+    betas: List[float],
+    losses_grid: List[List[float]],
+    title: str,
+    cmap: str = "viridis",
+    elev: int = 30,
+    azim: int = -60,
+) -> Image.Image:
+    """
+    3D surface plot with colormap.
+
+    Args:
+        alphas: X-axis values (direction 1 coefficients)
+        betas: Y-axis values (direction 2 coefficients)
+        losses_grid: 2D grid of loss values
+        title: Plot title
+        cmap: Colormap name
+        elev: Elevation angle for 3D view
+        azim: Azimuthal angle for 3D view
+
+    Returns:
+        PIL Image of the 3D surface plot
+    """
+    fig = plt.figure(figsize=(10, 8))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_title(title, fontsize=14)
+
+    if not alphas or not betas or not losses_grid:
+        ax.text2D(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        pil = _fig_to_pil(fig)
+        plt.close(fig)
+        return pil
+
+    X, Y = np.meshgrid(alphas, betas)
+    Z = np.asarray(losses_grid, dtype=np.float32)
+
+    surf = ax.plot_surface(X, Y, Z, cmap=cmap, linewidth=0, antialiased=True, alpha=0.9)
+
+    ax.set_xlabel("Direction 1 (α)")
+    ax.set_ylabel("Direction 2 (β)")
+    ax.set_zlabel("Loss")
+    ax.view_init(elev=elev, azim=azim)
+
+    fig.colorbar(surf, shrink=0.5, aspect=10, label="Loss")
+    plt.tight_layout()
+
+    pil = _fig_to_pil(fig)
+    plt.close(fig)
+    return pil
+
+
+def generate_loss_landscape_3d_with_contour(
+    alphas: List[float],
+    betas: List[float],
+    losses_grid: List[List[float]],
+    title: str,
+    cmap: str = "coolwarm",
+) -> Image.Image:
+    """
+    3D surface with 2D contour projection on bottom plane.
+
+    Args:
+        alphas: X-axis values (direction 1 coefficients)
+        betas: Y-axis values (direction 2 coefficients)
+        losses_grid: 2D grid of loss values
+        title: Plot title
+        cmap: Colormap name
+
+    Returns:
+        PIL Image of the combined 3D surface + contour projection
+    """
+    fig = plt.figure(figsize=(12, 9))
+    ax = fig.add_subplot(111, projection="3d")
+    ax.set_title(title, fontsize=14)
+
+    if not alphas or not betas or not losses_grid:
+        ax.text2D(0.5, 0.5, "No data", ha="center", va="center", transform=ax.transAxes)
+        pil = _fig_to_pil(fig)
+        plt.close(fig)
+        return pil
+
+    X, Y = np.meshgrid(alphas, betas)
+    Z = np.asarray(losses_grid, dtype=np.float32)
+
+    # 3D surface
+    surf = ax.plot_surface(X, Y, Z, cmap=cmap, alpha=0.8, linewidth=0, antialiased=True)
+
+    # 2D contour projection on bottom
+    offset = Z.min() - (Z.max() - Z.min()) * 0.1
+    ax.contourf(X, Y, Z, zdir="z", offset=offset, cmap=cmap, alpha=0.6)
+
+    ax.set_xlabel("Direction 1 (α)")
+    ax.set_ylabel("Direction 2 (β)")
+    ax.set_zlabel("Loss")
+    ax.set_zlim(offset, Z.max() * 1.05)
+
+    fig.colorbar(surf, shrink=0.5, aspect=10, label="Loss")
+    plt.tight_layout()
+
+    pil = _fig_to_pil(fig)
+    plt.close(fig)
+    return pil
+
+
+def generate_loss_landscape_plotly(
+    alphas: List[float],
+    betas: List[float],
+    losses_grid: List[List[float]],
+    title: str,
+) -> str:
+    """
+    Interactive 3D surface plot using Plotly.
+
+    Args:
+        alphas: X-axis values (direction 1 coefficients)
+        betas: Y-axis values (direction 2 coefficients)
+        losses_grid: 2D grid of loss values
+        title: Plot title
+
+    Returns:
+        HTML string for WandB Html logging
+    """
+    try:
+        import plotly.graph_objects as go
+    except ImportError:
+        return "<p>Plotly not installed. Install with: pip install plotly</p>"
+
+    if not alphas or not betas or not losses_grid:
+        return "<p>No data available for loss landscape</p>"
+
+    X, Y = np.meshgrid(alphas, betas)
+    Z = np.asarray(losses_grid, dtype=np.float32)
+
+    fig = go.Figure(
+        data=[
+            go.Surface(
+                x=X,
+                y=Y,
+                z=Z,
+                colorscale="Viridis",
+                contours=dict(
+                    z=dict(
+                        show=True,
+                        usecolormap=True,
+                        highlightcolor="white",
+                        project_z=True,
+                    )
+                ),
+            )
+        ]
+    )
+
+    fig.update_layout(
+        title=title,
+        scene=dict(
+            xaxis_title="Direction 1 (α)",
+            yaxis_title="Direction 2 (β)",
+            zaxis_title="Loss",
+        ),
+        width=800,
+        height=700,
+    )
+
+    return fig.to_html(include_plotlyjs="cdn", full_html=False)
 
 
 @torch.no_grad()
@@ -441,7 +664,9 @@ def generate_attention_entropy_per_head_heatmap(
         if hasattr(block.attn, "attn_map"):
             block.attn.attn_map = None
 
-    return generate_attention_entropy_per_head_heatmap_from_maps(attentions, figsize=figsize)
+    return generate_attention_entropy_per_head_heatmap_from_maps(
+        attentions, figsize=figsize
+    )
 
 
 def generate_head_ablation_heatmap(
@@ -472,6 +697,7 @@ def generate_head_ablation_heatmap(
     pil = _fig_to_pil(fig)
     plt.close(fig)
     return pil
+
 
 @torch.no_grad()
 def compute_pca_projection(embeddings: torch.Tensor) -> torch.Tensor:
@@ -1742,7 +1968,9 @@ def generate_embedding_pca_scatter(
     for idx, label in enumerate(unique):
         mask = y_np == label
         li = int(label)
-        name = class_names[li] if class_names and li < len(class_names) else f"Class {li}"
+        name = (
+            class_names[li] if class_names and li < len(class_names) else f"Class {li}"
+        )
         ax.scatter(
             pc2[mask, 0],
             pc2[mask, 1],
@@ -1753,8 +1981,8 @@ def generate_embedding_pca_scatter(
             edgecolors="none",
         )
 
-    ax.set_xlabel(f"PC1 ({evr[0]*100:.1f}% var)")
-    ax.set_ylabel(f"PC2 ({evr[1]*100:.1f}% var)")
+    ax.set_xlabel(f"PC1 ({evr[0] * 100:.1f}% var)")
+    ax.set_ylabel(f"PC2 ({evr[1] * 100:.1f}% var)")
     ax.set_title("Embedding PCA (2D)")
     ax.grid(True, alpha=0.2)
     ax.legend(loc="best", fontsize=8, ncol=2)
@@ -2129,7 +2357,9 @@ def generate_isotropy_evolution_plot(
     ax1 = axes[0]
     if isotropy_history:
         ax1.plot(epochs, isotropy_history, "b-", linewidth=2, marker="o", markersize=3)
-        ax1.axhline(y=0.1, color="r", linestyle="--", alpha=0.5, label="Healthy threshold")
+        ax1.axhline(
+            y=0.1, color="r", linestyle="--", alpha=0.5, label="Healthy threshold"
+        )
         ax1.fill_between(epochs, 0, isotropy_history, alpha=0.2)
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("Isotropy (min_eig / max_eig)")
@@ -2142,7 +2372,9 @@ def generate_isotropy_evolution_plot(
     ax2 = axes[1]
     if effective_rank_history:
         epochs2 = range(1, len(effective_rank_history) + 1)
-        ax2.plot(epochs2, effective_rank_history, "g-", linewidth=2, marker="o", markersize=3)
+        ax2.plot(
+            epochs2, effective_rank_history, "g-", linewidth=2, marker="o", markersize=3
+        )
         ax2.fill_between(epochs2, 0, effective_rank_history, alpha=0.2, color="green")
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Effective Rank")
@@ -2153,8 +2385,12 @@ def generate_isotropy_evolution_plot(
     ax3 = axes[2]
     if uniformity_history:
         epochs3 = range(1, len(uniformity_history) + 1)
-        ax3.plot(epochs3, uniformity_history, "purple", linewidth=2, marker="o", markersize=3)
-        ax3.axhline(y=0, color="gray", linestyle="--", alpha=0.5, label="Target (uniform)")
+        ax3.plot(
+            epochs3, uniformity_history, "purple", linewidth=2, marker="o", markersize=3
+        )
+        ax3.axhline(
+            y=0, color="gray", linestyle="--", alpha=0.5, label="Target (uniform)"
+        )
     ax3.set_xlabel("Epoch")
     ax3.set_ylabel("Uniformity Loss")
     ax3.set_title("Uniformity (↓ = more uniform)")
@@ -2194,7 +2430,9 @@ def generate_loss_accuracy_correlation_plot(
     min_len = min(len(loss_history), len(accuracy_history))
     if min_len < 2:
         ax = axes[0]
-        ax.text(0.5, 0.5, "Insufficient data\n(need >= 2 epochs)", ha="center", va="center")
+        ax.text(
+            0.5, 0.5, "Insufficient data\n(need >= 2 epochs)", ha="center", va="center"
+        )
         ax.axis("off")
         axes[1].axis("off")
         plt.tight_layout()
@@ -2232,7 +2470,9 @@ def generate_loss_accuracy_correlation_plot(
     # Panel 2: Time series overlay
     ax2 = axes[1]
     epochs = range(1, min_len + 1)
-    ax2.plot(epochs, losses / losses.max(), "b-", linewidth=2, label="Loss (normalized)")
+    ax2.plot(
+        epochs, losses / losses.max(), "b-", linewidth=2, label="Loss (normalized)"
+    )
     ax2.plot(epochs, accuracies / 100, "g-", linewidth=2, label="Accuracy (normalized)")
     ax2.set_xlabel("Epoch")
     ax2.set_ylabel("Normalized Value")
@@ -2286,7 +2526,13 @@ def generate_embedding_distribution_plot(
     z = embeddings.detach().float().cpu()
     if z.ndim != 2 or z.size(0) < 10:
         fig, ax = plt.subplots(figsize=(8, 6))
-        ax.text(0.5, 0.5, "Insufficient embeddings\n(need >= 10 samples)", ha="center", va="center")
+        ax.text(
+            0.5,
+            0.5,
+            "Insufficient embeddings\n(need >= 10 samples)",
+            ha="center",
+            va="center",
+        )
         ax.axis("off")
         img = _fig_to_pil(fig)
         plt.close(fig)
@@ -2331,7 +2577,13 @@ def generate_embedding_distribution_plot(
     ax3 = axes[1, 0]
     per_dim_var = z_centered.var(dim=0).numpy()
     ax3.hist(per_dim_var, bins=30, alpha=0.7, color="green")
-    ax3.axvline(per_dim_var.mean(), color="red", linestyle="--", linewidth=2, label=f"Mean={per_dim_var.mean():.3f}")
+    ax3.axvline(
+        per_dim_var.mean(),
+        color="red",
+        linestyle="--",
+        linewidth=2,
+        label=f"Mean={per_dim_var.mean():.3f}",
+    )
     # For isotropic, all variances should be equal
     cv = per_dim_var.std() / (per_dim_var.mean() + 1e-8)
     ax3.set_xlabel("Variance")
@@ -2404,10 +2656,26 @@ def generate_sigreg_loss_components_plot(
     ax1 = axes[0]
     if sigreg_history:
         epochs_sig = range(1, len(sigreg_history) + 1)
-        ax1.plot(epochs_sig, sigreg_history, "b-", linewidth=2, label="SIGReg", marker="o", markersize=3)
+        ax1.plot(
+            epochs_sig,
+            sigreg_history,
+            "b-",
+            linewidth=2,
+            label="SIGReg",
+            marker="o",
+            markersize=3,
+        )
     if invariance_history:
         epochs_inv = range(1, len(invariance_history) + 1)
-        ax1.plot(epochs_inv, invariance_history, "g-", linewidth=2, label="Invariance", marker="s", markersize=3)
+        ax1.plot(
+            epochs_inv,
+            invariance_history,
+            "g-",
+            linewidth=2,
+            label="Invariance",
+            marker="s",
+            markersize=3,
+        )
     ax1.set_xlabel("Epoch")
     ax1.set_ylabel("Loss Value")
     ax1.set_title("Raw Loss Components")
@@ -2425,7 +2693,10 @@ def generate_sigreg_loss_components_plot(
             epochs_w,
             weighted_sigreg,
             weighted_inv,
-            labels=[f"SIGReg (λ={lambda_sigreg})", f"Invariance (1-λ={1-lambda_sigreg})"],
+            labels=[
+                f"SIGReg (λ={lambda_sigreg})",
+                f"Invariance (1-λ={1 - lambda_sigreg})",
+            ],
             colors=["blue", "green"],
             alpha=0.7,
         )
@@ -2438,7 +2709,15 @@ def generate_sigreg_loss_components_plot(
     # Panel 3: Total loss with component ratio
     ax3 = axes[2]
     if total_history:
-        ax3.plot(epochs, total_history, "r-", linewidth=2, marker="^", markersize=3, label="Total Loss")
+        ax3.plot(
+            epochs,
+            total_history,
+            "r-",
+            linewidth=2,
+            marker="^",
+            markersize=3,
+            label="Total Loss",
+        )
         ax3.set_xlabel("Epoch")
         ax3.set_ylabel("Total Loss")
         ax3.set_title("Combined Loss")
@@ -2453,7 +2732,14 @@ def generate_sigreg_loss_components_plot(
                 sigreg_history[i] / (invariance_history[i] + 1e-8)
                 for i in range(min_len)
             ]
-            ax3_twin.plot(range(1, min_len + 1), ratios, "purple", linestyle="--", alpha=0.7, label="SIG/Inv ratio")
+            ax3_twin.plot(
+                range(1, min_len + 1),
+                ratios,
+                "purple",
+                linestyle="--",
+                alpha=0.7,
+                label="SIG/Inv ratio",
+            )
             ax3_twin.set_ylabel("SIGReg/Invariance Ratio", color="purple")
             ax3_twin.tick_params(axis="y", labelcolor="purple")
 

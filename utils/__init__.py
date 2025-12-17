@@ -54,6 +54,11 @@ from utils.visualization import (
     generate_loss_accuracy_correlation_plot,
     generate_embedding_distribution_plot,
     generate_sigreg_loss_components_plot,
+    # Loss landscape visualizations
+    generate_loss_landscape_contour,
+    generate_loss_landscape_3d,
+    generate_loss_landscape_3d_with_contour,
+    generate_loss_landscape_plotly,
 )
 
 __all__ = [
@@ -99,4 +104,9 @@ __all__ = [
     "generate_loss_accuracy_correlation_plot",
     "generate_embedding_distribution_plot",
     "generate_sigreg_loss_components_plot",
+    # Loss landscape visualizations
+    "generate_loss_landscape_contour",
+    "generate_loss_landscape_3d",
+    "generate_loss_landscape_3d_with_contour",
+    "generate_loss_landscape_plotly",
 ]

@@ -11,3 +11,5 @@ opencv-python>=4.8.0
 matplotlib>=3.7.0
 scikit-learn>=1.3.0
 umap-learn>=0.5.5
+loss-landscapes>=0.5.0
+plotly>=5.0.0
