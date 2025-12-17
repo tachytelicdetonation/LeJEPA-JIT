@@ -1414,7 +1414,7 @@ def main():
     try:
         iter_nette = iter(val_loader_nette)
         views, _ = next(iter_nette)
-        vis_images_nette = views[:8, 0].to(device)
+        vis_images_nette = views[:config.diagnostic_batch_size, 0].to(device)
     except StopIteration:
         print("Warning: ImageNette Validation loader is empty.")
 
@@ -1422,7 +1422,7 @@ def main():
     try:
         iter_woof = iter(val_loader_woof)
         views, _ = next(iter_woof)
-        vis_images_woof = views[:8, 0].to(device)
+        vis_images_woof = views[:config.diagnostic_batch_size, 0].to(device)
     except StopIteration:
         print("Warning: ImageWoof Validation loader is empty.")
 
