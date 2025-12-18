@@ -887,13 +887,18 @@ class LeJEPALossMetric(loss_landscapes.metrics.Metric):
         model = model_wrapper.get_model()
         # loss_landscapes deep-copies model to CPU; move it back to our device
         model = model.to(self.device)
+        # Ensure other components are also on the same device
+        probe = self.probe.to(self.device)
+        crops_dev = [c.to(self.device) for c in self.crops]
+        labels_dev = self.labels.to(self.device)
+        
         with torch.no_grad():
             loss, _ = _compute_training_loss_from_crops(
                 model,
-                self.probe,
+                probe,
                 self.loss_fn,
-                self.crops,
-                self.labels,
+                crops_dev,
+                labels_dev,
                 self.device,
                 self.mixed_precision,
             )
@@ -2906,7 +2911,11 @@ def main():
                                 raise RuntimeError(
                                     f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
                                 )
-                        diag_crops, diag_labels = next(iter(train_loader))
+                        batch_data = next(iter(train_loader))
+                        if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
+                            diag_crops, diag_labels = batch_data[0], batch_data[1]
+                        else:
+                            diag_crops, diag_labels = batch_data, None
                         b = min(
                             int(
                                 getattr(
@@ -2955,7 +2964,11 @@ def main():
                                 raise RuntimeError(
                                     f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
                                 )
-                        diag_crops, diag_labels = next(iter(train_loader))
+                        batch_data = next(iter(train_loader))
+                        if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
+                            diag_crops, diag_labels = batch_data[0], batch_data[1]
+                        else:
+                            diag_crops, diag_labels = batch_data, None
                         b = min(
                             int(
                                 getattr(
@@ -3004,7 +3017,11 @@ def main():
                                 raise RuntimeError(
                                     f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
                                 )
-                        diag_crops, diag_labels = next(iter(train_loader))
+                        batch_data = next(iter(train_loader))
+                        if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
+                            diag_crops, diag_labels = batch_data[0], batch_data[1]
+                        else:
+                            diag_crops, diag_labels = batch_data, None
                         b = min(
                             int(
                                 getattr(
@@ -3075,7 +3092,11 @@ def main():
                                 raise RuntimeError(
                                     f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
                                 )
-                        diag_crops, diag_labels = next(iter(train_loader))
+                        batch_data = next(iter(train_loader))
+                        if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
+                            diag_crops, diag_labels = batch_data[0], batch_data[1]
+                        else:
+                            diag_crops, diag_labels = batch_data, None
                         b = min(
                             int(
                                 getattr(
@@ -3199,6 +3220,7 @@ def main():
                         print(f"2D loss landscape diagnostics failed: {e}")
                     finally:
                         # Clean up GPU memory after heavy diagnostic
+                        del diag_crops, diag_labels, metric
                         _cleanup_gpu_memory(device)
 
                 if config.use_wandb and _every_or_first(
@@ -3221,7 +3243,11 @@ def main():
                                 raise RuntimeError(
                                     f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
                                 )
-                        diag_crops, diag_labels = next(iter(train_loader))
+                        batch_data = next(iter(train_loader))
+                        if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
+                            diag_crops, diag_labels = batch_data[0], batch_data[1]
+                        else:
+                            diag_crops, diag_labels = batch_data, None
                         b = min(
                             int(
                                 getattr(
@@ -3266,6 +3292,7 @@ def main():
                     except Exception as e:
                         print(f"Head ablation diagnostics failed: {e}")
                     finally:
+                        del diag_crops, diag_labels
                         _cleanup_gpu_memory(device)
 
                 # ==============================================================
@@ -3750,7 +3777,11 @@ def main():
                         ):
                             try:
                                 # Fetch a batch with labels for Q-Score
-                                qscore_crops, qscore_labels = next(iter(train_loader))
+                                batch_data = next(iter(train_loader))
+                                if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
+                                    qscore_crops, qscore_labels = batch_data[0], batch_data[1]
+                                else:
+                                    qscore_crops, qscore_labels = batch_data, None
                                 qscore_max = getattr(config, "qscore_max_samples", 1024)
                                 qscore_crops = [c[:qscore_max] for c in qscore_crops]
                                 qscore_labels = qscore_labels[:qscore_max]
@@ -3938,7 +3969,10 @@ def main():
                                 print(f"  Layer importance analysis failed: {e}")
 
                         # Store current metrics for next epoch delta
-                        prev_epoch_metrics = current_epoch_metrics.copy()
+                        if "current_epoch_metrics" in locals():
+                            prev_epoch_metrics = current_epoch_metrics.copy()
+                        else:
+                            print("Warning: current_epoch_metrics not found, skipping history update.")
 
                     except Exception as e:
                         print(f"Production dashboard failed: {e}")
