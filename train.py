@@ -25,6 +25,8 @@ from contextlib import nullcontext
 from pathlib import Path
 import os
 
+import numpy as np
+from PIL import Image
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -89,6 +91,39 @@ from attention_analysis.visualization import (
     compare_methods_visual,
     plot_head_importance,
 )
+
+
+def _tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
+    """
+    Convert a CHW or HWC tensor to PIL Image.
+
+    Handles normalization and dtype conversion properly to avoid
+    'Cannot handle this data type' errors from PIL.
+    """
+    if tensor.dim() == 4:
+        tensor = tensor[0]  # Remove batch dim
+    arr = tensor.detach().cpu().numpy()
+    # Handle CHW -> HWC
+    if arr.ndim == 3 and arr.shape[0] in (1, 3):
+        arr = np.transpose(arr, (1, 2, 0))
+    # Squeeze single channel
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        arr = arr.squeeze(2)
+    # Normalize to [0, 255]
+    arr = np.clip(arr, 0.0, None)  # Ensure non-negative
+    if arr.max() <= 1.0 + 1e-6:
+        arr = arr * 255.0
+    arr = np.clip(arr, 0, 255).astype(np.uint8)
+    return Image.fromarray(arr)
+
+
+def _cleanup_gpu_memory(device: torch.device) -> None:
+    """Force garbage collection and CUDA cache cleanup."""
+    import gc
+
+    gc.collect()
+    if device.type == "cuda":
+        torch.cuda.empty_cache()
 
 
 def _cosine_ema_coeff(
@@ -850,6 +885,8 @@ class LeJEPALossMetric(loss_landscapes.metrics.Metric):
     def __call__(self, model_wrapper) -> float:
         """Evaluate loss at current parameter point."""
         model = model_wrapper.get_model()
+        # loss_landscapes deep-copies model to CPU; move it back to our device
+        model = model.to(self.device)
         with torch.no_grad():
             loss, _ = _compute_training_loss_from_crops(
                 model,
@@ -3160,6 +3197,9 @@ def main():
                             )
                     except Exception as e:
                         print(f"2D loss landscape diagnostics failed: {e}")
+                    finally:
+                        # Clean up GPU memory after heavy diagnostic
+                        _cleanup_gpu_memory(device)
 
                 if config.use_wandb and _every_or_first(
                     epoch, config.head_ablation_interval
@@ -3225,6 +3265,8 @@ def main():
                             )
                     except Exception as e:
                         print(f"Head ablation diagnostics failed: {e}")
+                    finally:
+                        _cleanup_gpu_memory(device)
 
                 # ==============================================================
                 # Attention Analysis Module - Epoch-level logging
@@ -3256,8 +3298,12 @@ def main():
                                         overlay_attribution,
                                     )
 
+                                    # Convert tensor to PIL to avoid dtype issues
+                                    probe_img_pil = _tensor_to_pil(
+                                        attribution_probe_images[0]
+                                    )
                                     overlay = overlay_attribution(
-                                        attribution_probe_images[0],
+                                        probe_img_pil,
                                         attr,
                                         alpha=0.5,
                                     )
@@ -3275,8 +3321,12 @@ def main():
                             # Log comparison visualization
                             if len(method_attrs) > 1:
                                 try:
+                                    # Use PIL image for comparison (reuse from above)
+                                    comp_img_pil = _tensor_to_pil(
+                                        attribution_probe_images[0]
+                                    )
                                     comparison = compare_methods_visual(
-                                        attribution_probe_images[0],
+                                        comp_img_pil,
                                         method_attrs,
                                     )
                                     wandb.log(
@@ -3380,6 +3430,8 @@ def main():
 
                     except Exception as e:
                         print(f"Attention analysis failed: {e}")
+                    finally:
+                        _cleanup_gpu_memory(device)
 
                 # ==============================================================
                 # Production Dashboard - Health Checks & Summary Dashboards
@@ -3391,6 +3443,9 @@ def main():
                     try:
                         # Fetch diagnostic batch for dashboard visualizations
                         batch_data = next(iter(train_loader))
+                        # Handle different dataloader return formats:
+                        # - (crops_list, labels) where crops_list is [global1, global2, local...]
+                        # - single tensor
                         if (
                             isinstance(batch_data, (list, tuple))
                             and len(batch_data) >= 2
@@ -3398,10 +3453,15 @@ def main():
                             diag_crops_dash = batch_data[0]
                         else:
                             diag_crops_dash = batch_data
-                        b_dash = min(
-                            config.diagnostic_batch_size, len(diag_crops_dash[0])
-                        )
-                        diag_images = diag_crops_dash[0][:b_dash].to(device)
+
+                        # Get first crop tensor from the crops list
+                        if isinstance(diag_crops_dash, (list, tuple)):
+                            first_crop = diag_crops_dash[0]
+                        else:
+                            first_crop = diag_crops_dash
+
+                        b_dash = min(config.diagnostic_batch_size, first_crop.shape[0])
+                        diag_images = first_crop[:b_dash].to(device)
 
                         # Get attention maps if available
                         diag_attn_maps = None
@@ -3882,6 +3942,8 @@ def main():
 
                     except Exception as e:
                         print(f"Production dashboard failed: {e}")
+                    finally:
+                        _cleanup_gpu_memory(device)
 
             except Exception as e:
                 print(f"Error generating visualization: {e}")
