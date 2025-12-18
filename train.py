@@ -887,6 +887,8 @@ class LeJEPALossMetric(loss_landscapes.metrics.Metric):
         model = model_wrapper.get_model()
         # loss_landscapes deep-copies model to CPU; move it back to our device
         model = model.to(self.device)
+        # Ensure loss function and its buffers are on the same device
+        loss_fn = self.loss_fn.to(self.device)
         # Ensure other components are also on the same device
         probe = self.probe.to(self.device)
         crops_dev = [c.to(self.device) for c in self.crops]
@@ -896,13 +898,13 @@ class LeJEPALossMetric(loss_landscapes.metrics.Metric):
             loss, _ = _compute_training_loss_from_crops(
                 model,
                 probe,
-                self.loss_fn,
+                loss_fn,
                 crops_dev,
                 labels_dev,
                 self.device,
                 self.mixed_precision,
             )
-        return float(loss.item())
+        return float(loss)
 
 
 def _select_diag_params(model: nn.Module) -> list[tuple[str, torch.nn.Parameter]]:
@@ -3638,47 +3640,45 @@ def main():
                                         commit=False,
                                     )
 
-                        # Summary dashboard
-                        if _every_or_first(
-                            epoch, getattr(config, "summary_dashboard_interval", 1)
-                        ):
-                            try:
-                                dashboard = generate_epoch_summary_dashboard(
-                                    epoch=epoch,
-                                    metrics=current_epoch_metrics,
-                                    history=metric_history,
-                                )
-                                wandb.log(
-                                    {
-                                        "summary/dashboard": wandb.Image(
-                                            dashboard, caption=f"Epoch {epoch}"
-                                        )
-                                    },
-                                    commit=False,
-                                )
-                            except Exception as e:
-                                print(f"  Dashboard generation failed: {e}")
+                                try:
+                                    print("  Debug: Generating epoch summary dashboard...")
+                                    dashboard = generate_epoch_summary_dashboard(
+                                        epoch=epoch,
+                                        metrics=current_epoch_metrics,
+                                        history=metric_history,
+                                    )
+                                    wandb.log(
+                                        {
+                                            "summary/dashboard": wandb.Image(
+                                                dashboard, caption=f"Epoch {epoch}"
+                                            )
+                                        },
+                                        commit=False,
+                                    )
+                                except Exception as e:
+                                    print(f"    Summary dashboard failed: {e}")
 
-                        # Epoch delta dashboard
-                        if epoch > 1 and _every_or_first(
-                            epoch, getattr(config, "epoch_delta_interval", 1)
-                        ):
-                            try:
-                                delta_dashboard = generate_epoch_delta_dashboard(
-                                    current_epoch=epoch,
-                                    current_metrics=current_epoch_metrics,
-                                    previous_metrics=prev_epoch_metrics,
-                                )
-                                wandb.log(
-                                    {
-                                        "summary/epoch_delta": wandb.Image(
-                                            delta_dashboard, caption=f"Epoch {epoch}"
+                                # Epoch delta dashboard
+                                if epoch > 1 and _every_or_first(
+                                    epoch, getattr(config, "epoch_delta_interval", 1)
+                                ):
+                                    try:
+                                        print("  Debug: Generating epoch delta dashboard...")
+                                        delta_dashboard = generate_epoch_delta_dashboard(
+                                            current_epoch=epoch,
+                                            current_metrics=current_epoch_metrics,
+                                            previous_metrics=prev_epoch_metrics,
                                         )
-                                    },
-                                    commit=False,
-                                )
-                            except Exception as e:
-                                print(f"  Delta dashboard failed: {e}")
+                                        wandb.log(
+                                            {
+                                                "summary/epoch_delta": wandb.Image(
+                                                    delta_dashboard, caption=f"Epoch {epoch}"
+                                                )
+                                            },
+                                            commit=False,
+                                        )
+                                    except Exception as e:
+                                        print(f"    Delta dashboard failed: {e}")
 
                         # Training radar chart
                         if _every_or_first(
