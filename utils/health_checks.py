@@ -505,10 +505,15 @@ def generate_health_summary_html(
     ) -> str:
         if value is None:
             return ""
+        range_html = (
+            f" <span style='opacity: 0.6;'>(good: {good_range})</span>"
+            if good_range
+            else ""
+        )
         return (
             f'<div style="margin: 2px 0; color: #b5b5b5;">'
-            f'  &bull; {name}: <strong style="color: #e5e5e5;">{value:.3f}</strong>{unit}'
-            f"{f" <span style='opacity: 0.6;'>(good: {good_range})</span>" if good_range else ''}"
+            f"  &bull; {name}: <strong style='color: #e5e5e5;'>{value:.3f}</strong>{unit}"
+            f"{range_html}"
             f"</div>"
         )
 
