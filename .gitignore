@@ -209,6 +209,7 @@ __marimo__/
 
 # Claude instructions (local only)
 Claude.md
+.claude/
 
 # Reference repos (local only)
 ref/
