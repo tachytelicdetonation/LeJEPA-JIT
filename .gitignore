@@ -219,3 +219,12 @@ data/imagewoof*/
 
 # macOS
 .DS_Store
+node_modules
+
+# Training outputs
+outputs/
+wandb/
+
+# Node
+package.json
+package-lock.json

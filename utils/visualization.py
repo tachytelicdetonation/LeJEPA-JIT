@@ -827,15 +827,45 @@ def generate_pca_visualization(
 
         vis_imgs.append(combined)
 
-    # Combine all into a horizontal grid
-    grid_width = img_size * B
-    grid_height = img_size * 2
-    grid = Image.new("RGB", (grid_width, grid_height))
+    # Create figure with proper labels using matplotlib
+    fig, axes = plt.subplots(2, B, figsize=(3 * B, 6))
+    if B == 1:
+        axes = axes.reshape(2, 1)
 
-    for i, img in enumerate(vis_imgs):
-        grid.paste(img, (i * img_size, 0))
+    for i in range(B):
+        # Original image
+        img = images[i].detach().cpu()
+        img = (img - img.min()) / (img.max() - img.min())
+        img_np = img.permute(1, 2, 0).numpy()
 
-    return grid
+        axes[0, i].imshow(img_np)
+        axes[0, i].set_title(f"Sample {i + 1}" if i > 0 else "Original")
+        axes[0, i].axis("off")
+
+        # PCA map
+        pca = pca_maps[i].detach().cpu().numpy()
+        axes[1, i].imshow(pca)
+        axes[1, i].set_title("PCA Features" if i == 0 else "")
+        axes[1, i].axis("off")
+
+    # Add legend explaining RGB = PC1/PC2/PC3
+    fig.text(
+        0.5,
+        0.02,
+        "PCA Color Mapping: R=PC1, G=PC2, B=PC3 | Similar colors = similar features",
+        ha="center",
+        fontsize=10,
+        style="italic",
+        bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5),
+    )
+
+    plt.suptitle("Patch-Level PCA Visualization", fontsize=12, fontweight="bold")
+    plt.tight_layout(rect=[0, 0.05, 1, 0.95])
+
+    img = _fig_to_pil(fig)
+    plt.close(fig)
+
+    return img
 
 
 @torch.no_grad()
@@ -1146,21 +1176,27 @@ def generate_layer_attention_evolution(
     # Original image
     img = images[sample_idx].detach().cpu()
     img = (img - img.min()) / (img.max() - img.min())
-    img_pil = TF.to_pil_image(img).resize((img_size, img_size))
+    img_np = img.permute(1, 2, 0).numpy()
 
-    # Create grid: Original + each layer
-    cols = min(6, num_layers + 1)
+    # Create matplotlib figure with better layout
+    cols = min(7, num_layers + 1)  # +1 for original
     rows = (num_layers + 1 + cols - 1) // cols
 
-    grid_width = cols * img_size
-    grid_height = rows * img_size
-    grid = Image.new("RGB", (grid_width, grid_height), (255, 255, 255))
+    fig, axes = plt.subplots(rows, cols, figsize=(2.5 * cols, 2.5 * rows))
+    axes = np.atleast_2d(axes)
 
-    # Paste original
-    grid.paste(img_pil, (0, 0))
+    # Flatten axes for easier indexing
+    axes_flat = axes.flatten()
 
-    # Add layer attentions
+    # Plot original image
+    axes_flat[0].imshow(img_np)
+    axes_flat[0].set_title("Original", fontsize=10, fontweight="bold")
+    axes_flat[0].axis("off")
+
+    # Plot attention for each layer
     for layer_idx, attn in enumerate(attentions):
+        ax = axes_flat[layer_idx + 1]
+
         # attn: (B, H, N, N)
         attn_sample = attn[sample_idx].mean(dim=0)  # (N, N), mean over heads
 
@@ -1172,26 +1208,33 @@ def generate_layer_attention_evolution(
         mask = mask.detach().cpu().numpy()
         mask = (mask - mask.min()) / (mask.max() - mask.min() + 1e-6)
 
-        # Colorize with layer-specific color progression
-        # Early layers: blue, late layers: red
-        progress = layer_idx / max(1, num_layers - 1)
-        cmap = cv2.COLORMAP_JET if progress > 0.5 else cv2.COLORMAP_COOL
+        # Resize mask to image size
+        mask_resized = cv2.resize(mask, (img_np.shape[1], img_np.shape[0]))
 
-        m = cv2.applyColorMap(np.uint8(255 * mask), cmap)
-        m = cv2.cvtColor(m, cv2.COLOR_BGR2RGB)
-        m = Image.fromarray(m).resize((img_size, img_size), resample=Image.BILINEAR)
+        # Show original with attention overlay
+        ax.imshow(img_np)
+        ax.imshow(mask_resized, cmap="jet", alpha=0.5)
 
-        overlay = Image.blend(img_pil, m, alpha=0.5)
+        # Layer label with entropy info
+        entropy = -np.sum(mask * np.log(mask + 1e-8))
+        ax.set_title(f"L{layer_idx} (H={entropy:.1f})", fontsize=9)
+        ax.axis("off")
 
-        # Add layer label
-        draw = ImageDraw.Draw(overlay)
-        draw.text((5, 5), f"L{layer_idx}", fill=(255, 255, 255))
+    # Hide unused axes
+    for idx in range(num_layers + 1, len(axes_flat)):
+        axes_flat[idx].axis("off")
 
-        pos_x = ((layer_idx + 1) % cols) * img_size
-        pos_y = ((layer_idx + 1) // cols) * img_size
-        grid.paste(overlay, (pos_x, pos_y))
+    plt.suptitle(
+        "Attention Evolution Across Layers\n(Early→Late: diffuse→focused)",
+        fontsize=11,
+        fontweight="bold",
+    )
+    plt.tight_layout(rect=[0, 0, 1, 0.95])
 
-    return grid
+    result = _fig_to_pil(fig)
+    plt.close(fig)
+
+    return result
 
 
 # =============================================================================
@@ -1594,14 +1637,40 @@ def generate_token_similarity_heatmap(
     sim = torch.mm(feat_norm, feat_norm.T)  # (N, N)
     sim = sim.detach().cpu().numpy()
 
+    N = sim.shape[0]
+    grid_size = int(N**0.5)  # Assuming square patch grid
+
     # Create figure
     fig, ax = plt.subplots(figsize=figsize)
 
     im = ax.imshow(sim, cmap="coolwarm", vmin=-1, vmax=1)
-    ax.set_xlabel("Patch Token")
-    ax.set_ylabel("Patch Token")
-    ax.set_title("Patch Token Cosine Similarity")
-    plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    ax.set_xlabel("Patch Token Index")
+    ax.set_ylabel("Patch Token Index")
+    ax.set_title("Patch Token Cosine Similarity", fontsize=12, fontweight="bold")
+
+    # Add grid lines at row boundaries (every grid_size patches)
+    for i in range(0, N + 1, grid_size):
+        ax.axhline(y=i - 0.5, color="white", linewidth=0.5, alpha=0.5)
+        ax.axvline(x=i - 0.5, color="white", linewidth=0.5, alpha=0.5)
+
+    # Add colorbar with label
+    cbar = plt.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+    cbar.set_label("Cosine Similarity", rotation=270, labelpad=15)
+
+    # Add interpretation text
+    mean_sim = np.mean(sim[np.triu_indices(N, k=1)])
+    interpretation = (
+        "Collapsed!" if mean_sim > 0.95 else "Diverse" if mean_sim < 0.5 else "Moderate"
+    )
+    ax.text(
+        0.02,
+        0.98,
+        f"Mean off-diag: {mean_sim:.3f} ({interpretation})",
+        transform=ax.transAxes,
+        fontsize=9,
+        verticalalignment="top",
+        bbox=dict(boxstyle="round", facecolor="white", alpha=0.8),
+    )
 
     plt.tight_layout()
 
@@ -1672,6 +1741,8 @@ def generate_rsm_across_layers(
 
     fig, axes = plt.subplots(1, len(selected_indices), figsize=figsize)
 
+    B = images.shape[0]  # Number of samples
+
     for ax_idx, layer_idx in enumerate(selected_indices):
         feat = layer_features[layer_idx][1]  # (B, N, D)
 
@@ -1686,13 +1757,37 @@ def generate_rsm_across_layers(
         rsm = torch.mm(feat_norm, feat_norm.T).detach().cpu().numpy()
 
         im = axes[ax_idx].imshow(rsm, cmap="coolwarm", vmin=-1, vmax=1)
-        axes[ax_idx].set_xlabel("Sample")
-        axes[ax_idx].set_ylabel("Sample")
-        axes[ax_idx].set_title(f"Layer {layer_idx}")
+        axes[ax_idx].set_xlabel("Sample Index")
+        axes[ax_idx].set_ylabel("Sample Index")
+        axes[ax_idx].set_title(f"Layer {layer_idx}", fontsize=11, fontweight="bold")
 
-    plt.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.04)
-    plt.suptitle("Representational Similarity Matrix (RSM) Across Layers")
-    plt.tight_layout()
+        # Set proper tick labels
+        tick_positions = list(range(B))
+        axes[ax_idx].set_xticks(tick_positions)
+        axes[ax_idx].set_yticks(tick_positions)
+        axes[ax_idx].set_xticklabels([str(i) for i in tick_positions])
+        axes[ax_idx].set_yticklabels([str(i) for i in tick_positions])
+
+        # Add mean similarity annotation
+        mean_sim = np.mean(rsm[np.triu_indices(B, k=1)]) if B > 1 else 1.0
+        axes[ax_idx].text(
+            0.02,
+            0.98,
+            f"μ={mean_sim:.2f}",
+            transform=axes[ax_idx].transAxes,
+            fontsize=8,
+            verticalalignment="top",
+            bbox=dict(boxstyle="round", facecolor="white", alpha=0.7),
+        )
+
+    cbar = plt.colorbar(im, ax=axes.ravel().tolist(), fraction=0.02, pad=0.04)
+    cbar.set_label("Cosine Similarity", rotation=270, labelpad=15)
+    plt.suptitle(
+        "Representational Similarity Matrix (RSM) Across Layers",
+        fontsize=12,
+        fontweight="bold",
+    )
+    plt.tight_layout(rect=[0, 0, 0.95, 0.95])
 
     img = _fig_to_pil(fig)
     plt.close(fig)

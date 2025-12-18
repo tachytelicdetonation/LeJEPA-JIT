@@ -202,6 +202,61 @@ class Config:
     # Number of probe images for consistent attribution tracking
     attribution_probe_size: int = 8
 
+    # =============================================================================
+    # Production Dashboard Settings
+    # =============================================================================
+
+    # Enable production dashboard with organized metrics
+    production_dashboard_enabled: bool = True
+
+    # Summary dashboard interval (epochs)
+    summary_dashboard_interval: int = 1
+
+    # Epoch delta dashboard (shows changes from previous epoch)
+    epoch_delta_interval: int = 1
+
+    # Training radar chart interval
+    training_radar_interval: int = 5
+
+    # Health check interval and recommendations
+    health_check_enabled: bool = True
+    health_check_interval: int = 1  # Check every epoch
+
+    # Pattern classification interval
+    pattern_classification_interval: int = 5
+
+    # Q-Score computation interval (moderately expensive)
+    qscore_interval: int = 10
+    qscore_max_samples: int = 1024
+
+    # Head specialization analysis
+    head_specialization_analysis_interval: int = 5
+
+    # Layer importance analysis
+    layer_importance_interval: int = 10
+
+    # RoPE position correlation (JiT only)
+    rope_correlation_interval: int = 10
+
+    # SwiGLU sparsity analysis (JiT only)
+    swiglu_sparsity_interval: int = 10
+
+    # =============================================================================
+    # Metric Naming - Production Organization
+    # =============================================================================
+
+    # Use new hierarchical metric naming (summary/, health/, attn/, etc.)
+    # Setting to True reorganizes all metrics for cleaner WandB sections
+    use_hierarchical_metrics: bool = True
+
+    # =============================================================================
+    # Quick Verification / Testing
+    # =============================================================================
+
+    # Limit dataset size for quick verification runs (None = use full dataset)
+    max_train_samples: int | None = None
+    max_val_samples: int | None = None
+
     # Seed
     seed: int = 42
 

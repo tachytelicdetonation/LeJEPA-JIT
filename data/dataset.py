@@ -246,6 +246,9 @@ def get_dataloaders(
     local_crops_size: int = 96,
     local_crops_scale: tuple = (0.05, 0.3),
     global_crops_scale: tuple = (0.3, 1.0),
+    # Subset params for quick testing
+    max_train_samples: int | None = None,
+    max_val_samples: int | None = None,
 ) -> tuple[DataLoader, DataLoader, DataLoader]:
     """
     Create training and validation dataloaders for combined ImageNette + ImageWoof.
@@ -256,7 +259,13 @@ def get_dataloaders(
         num_workers: Number of data loading workers
         pin_memory: Pin memory for faster GPU transfer
         data_dir: Ignored (uses IMAGENETTE_DIR and IMAGEWOOF_DIR)
-        ... : Multi-crop parameters
+        local_crops_number: Number of local crops
+        local_crops_size: Size of local crops
+        local_crops_scale: Scale range for local crops
+        global_crops_scale: Scale range for global crops
+        max_train_samples: If provided, limit training set to this many samples.
+                          Useful for quick verification runs (~100 samples).
+        max_val_samples: If provided, limit validation sets to this many samples.
 
     Returns:
         (train_loader, val_loader_imagenette, val_loader_imagewoof)
@@ -292,6 +301,11 @@ def get_dataloaders(
     # Combined Training Dataset
     train_dataset = torch.utils.data.ConcatDataset([train_ds_nette, train_ds_woof])
 
+    # Subset training data if requested (for quick verification)
+    if max_train_samples is not None and max_train_samples < len(train_dataset):
+        indices = list(range(min(max_train_samples, len(train_dataset))))
+        train_dataset = torch.utils.data.Subset(train_dataset, indices)
+
     # 3. ImageNette Validation
     val_ds_nette = ImageNetteDataset(
         split="val",
@@ -311,6 +325,15 @@ def get_dataloaders(
         is_training=False,
         class_offset=10,  # Maintain offset for consistent evaluation with probe
     )
+
+    # Subset validation data if requested (for quick verification)
+    if max_val_samples is not None:
+        if max_val_samples < len(val_ds_nette):
+            indices = list(range(min(max_val_samples, len(val_ds_nette))))
+            val_ds_nette = torch.utils.data.Subset(val_ds_nette, indices)
+        if max_val_samples < len(val_ds_woof):
+            indices = list(range(min(max_val_samples, len(val_ds_woof))))
+            val_ds_woof = torch.utils.data.Subset(val_ds_woof, indices)
 
     train_loader = DataLoader(
         train_dataset,

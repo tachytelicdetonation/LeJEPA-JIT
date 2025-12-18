@@ -9,10 +9,12 @@ Includes:
 - Effective rank of representations
 """
 
-from typing import Optional
+from dataclasses import dataclass
+from typing import Literal, Optional
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 # =============================================================================
 # Attention Statistics
@@ -874,4 +876,490 @@ def compute_feature_collapse_metrics(embeddings: torch.Tensor) -> dict:
         "std": std,  # Low = bad
         "effective_rank": effective_rank,  # Low = bad
         "uniformity": uniformity,  # High = bad
+    }
+
+
+# =============================================================================
+# Research-Backed Metrics for Advanced Analysis
+# Based on:
+# - Head Pursuit: Attention Specialization (arXiv 2510.21518)
+# - Attention Pattern Classification (Guo 2024)
+# - SSL Representation Quality Score (arXiv 2203.01881)
+# =============================================================================
+
+
+@dataclass
+class HeadSpecializationResult:
+    """Result of head specialization analysis."""
+
+    specialization_matrix: torch.Tensor  # (layers, heads) - uniqueness score per head
+    redundancy_score: float  # Fraction of redundant heads
+    diversity_score: float  # Overall pattern diversity
+    similarity_matrix: torch.Tensor  # (total_heads, total_heads) pairwise similarity
+
+
+@dataclass
+class PatternClassificationResult:
+    """Result of attention pattern classification."""
+
+    pattern_counts: dict  # Count per pattern type
+    pattern_distribution: dict  # Percentage per pattern type
+    dominant_pattern: str  # Most common pattern
+    per_head_patterns: list  # Pattern type for each (layer, head)
+
+
+@dataclass
+class QScoreResult:
+    """Result of representation quality score computation."""
+
+    mean_qscore: float  # Mean Q-Score across samples
+    std_qscore: float  # Standard deviation
+    min_qscore: float  # Minimum (worst sample)
+    max_qscore: float  # Maximum (best sample)
+    per_sample_scores: torch.Tensor  # Individual sample scores
+
+
+def compute_head_specialization(
+    attention_maps: list,
+    similarity_threshold: float = 0.9,
+) -> HeadSpecializationResult:
+    """
+    Compute head specialization index based on attention pattern uniqueness.
+
+    Measures how unique each head's attention pattern is compared to others.
+    Based on the Head Pursuit paper (arXiv 2510.21518).
+
+    Args:
+        attention_maps: List of attention tensors per layer, each (B, H, N, N)
+        similarity_threshold: Threshold for considering heads redundant
+
+    Returns:
+        HeadSpecializationResult with specialization metrics
+    """
+    if not attention_maps:
+        return HeadSpecializationResult(
+            specialization_matrix=torch.zeros(0, 0),
+            redundancy_score=0.0,
+            diversity_score=0.0,
+            similarity_matrix=torch.zeros(0, 0),
+        )
+
+    device = attention_maps[0].device
+    num_layers = len(attention_maps)
+    num_heads = attention_maps[0].shape[1]
+    total_heads = num_layers * num_heads
+
+    # Flatten attention patterns for comparison
+    flat_patterns = []
+    for layer_attn in attention_maps:
+        # Average over batch dimension, flatten spatial dimensions
+        avg_attn = layer_attn.mean(dim=0)  # (H, N, N)
+        for h in range(num_heads):
+            flat_patterns.append(avg_attn[h].flatten())
+
+    pattern_matrix = torch.stack(flat_patterns)  # (total_heads, N*N)
+
+    # Normalize for cosine similarity
+    pattern_matrix = F.normalize(pattern_matrix, p=2, dim=1)
+
+    # Compute pairwise cosine similarity
+    similarity_matrix = pattern_matrix @ pattern_matrix.T
+
+    # Compute specialization as 1 - max_similarity_to_other_heads
+    mask = torch.eye(total_heads, device=device, dtype=torch.bool)
+    sim_no_diag = similarity_matrix.clone()
+    sim_no_diag[mask] = -1
+
+    max_similarity = sim_no_diag.max(dim=1).values
+    specialization_flat = 1.0 - max_similarity
+
+    specialization_matrix = specialization_flat.view(num_layers, num_heads)
+
+    # Count redundant heads
+    redundant_mask = max_similarity > similarity_threshold
+    redundancy_score = redundant_mask.float().mean().item()
+
+    diversity_score = specialization_flat.mean().item()
+
+    return HeadSpecializationResult(
+        specialization_matrix=specialization_matrix,
+        redundancy_score=redundancy_score,
+        diversity_score=diversity_score,
+        similarity_matrix=similarity_matrix,
+    )
+
+
+def _classify_single_head_pattern(
+    attn: torch.Tensor,
+    entropy_low: float = 1.0,
+    entropy_high: float = 3.5,
+    uniform_thresh: float = 0.1,
+) -> Literal["parallel", "radioactive", "homogeneous", "xtype", "compound"]:
+    """Classify a single attention head pattern."""
+    n = attn.shape[0]
+    eps = 1e-10
+
+    # Compute row-wise entropy
+    row_entropy = -(attn * (attn + eps).log()).sum(dim=1)
+    mean_entropy = row_entropy.mean().item()
+
+    # Check for radioactive (single token dominates)
+    if mean_entropy < entropy_low:
+        return "radioactive"
+
+    # Check for parallel (uniform attention)
+    if mean_entropy > entropy_high:
+        col_std = attn.std(dim=0).mean().item()
+        if col_std < uniform_thresh:
+            return "parallel"
+
+    # Check for homogeneous (all rows similar)
+    row_std = attn.std(dim=0).mean()
+    col_variance = attn.var(dim=1).mean()
+
+    if row_std < uniform_thresh and col_variance > 0.01:
+        return "homogeneous"
+
+    # Check for X-type (diagonal structure)
+    diagonal_mass = torch.diag(attn).mean().item()
+    off_diagonal_mass = (attn.sum() - torch.diag(attn).sum()) / max(n * n - n, 1)
+    off_diagonal_mass = off_diagonal_mass.item()
+
+    if diagonal_mass > 3 * off_diagonal_mass:
+        return "xtype"
+
+    return "compound"
+
+
+def classify_attention_patterns(
+    attention_maps: list,
+    entropy_threshold_low: float = 1.0,
+    entropy_threshold_high: float = 3.5,
+    uniformity_threshold: float = 0.1,
+) -> PatternClassificationResult:
+    """
+    Classify attention heads into pattern types.
+
+    Based on Guo 2024 paper on attention pattern types:
+    1. Parallel - Uniform attention across tokens (high entropy, low variance)
+    2. Radioactive - Single token dominates (very low entropy)
+    3. Homogeneous - All tokens attend to same targets (low row variance)
+    4. X-type - Distinct cross-attention patterns (diagonal structure)
+    5. Compound - Mixed/complex patterns
+
+    Args:
+        attention_maps: List of attention tensors per layer, each (B, H, N, N)
+
+    Returns:
+        PatternClassificationResult with pattern classification
+    """
+    pattern_counts = {
+        "parallel": 0,
+        "radioactive": 0,
+        "homogeneous": 0,
+        "xtype": 0,
+        "compound": 0,
+    }
+    per_head_patterns = []
+
+    for layer_attn in attention_maps:
+        layer_patterns = []
+        avg_attn = layer_attn.mean(dim=0)  # (H, N, N)
+        num_heads = avg_attn.shape[0]
+
+        for h in range(num_heads):
+            head_attn = avg_attn[h]
+            pattern = _classify_single_head_pattern(
+                head_attn,
+                entropy_threshold_low,
+                entropy_threshold_high,
+                uniformity_threshold,
+            )
+            pattern_counts[pattern] += 1
+            layer_patterns.append(pattern)
+
+        per_head_patterns.append(layer_patterns)
+
+    total_heads = sum(pattern_counts.values())
+    pattern_distribution = {
+        k: v / total_heads if total_heads > 0 else 0.0
+        for k, v in pattern_counts.items()
+    }
+    dominant_pattern = max(pattern_counts, key=lambda k: pattern_counts[k])
+
+    return PatternClassificationResult(
+        pattern_counts=pattern_counts,
+        pattern_distribution=pattern_distribution,
+        dominant_pattern=dominant_pattern,
+        per_head_patterns=per_head_patterns,
+    )
+
+
+def compute_representation_qscore(
+    embeddings: torch.Tensor,
+    labels: torch.Tensor,
+    k: int = 10,
+) -> QScoreResult:
+    """
+    Compute Self-Supervised Representation Quality Score (Q-Score).
+
+    Based on arXiv 2203.01881 - predicts likelihood of misclassification
+    based on embedding structure. Low Q-Score = likely to be misclassified.
+
+    Args:
+        embeddings: (N, D) tensor of embeddings
+        labels: (N,) tensor of class labels
+        k: Number of neighbors for local analysis
+
+    Returns:
+        QScoreResult with quality scores
+    """
+    device = embeddings.device
+    n_samples = embeddings.shape[0]
+
+    if n_samples < k + 1:
+        return QScoreResult(
+            mean_qscore=0.5,
+            std_qscore=0.0,
+            min_qscore=0.5,
+            max_qscore=0.5,
+            per_sample_scores=torch.full((n_samples,), 0.5, device=device),
+        )
+
+    # Normalize embeddings
+    embeddings = F.normalize(embeddings.float(), p=2, dim=1)
+
+    # Compute pairwise distances
+    dists = torch.cdist(embeddings, embeddings)
+
+    # Get unique classes
+    unique_labels = labels.unique()
+
+    # Compute class centroids
+    centroids = []
+    for lbl in unique_labels:
+        mask = labels == lbl
+        centroids.append(embeddings[mask].mean(dim=0))
+    centroids = torch.stack(centroids)
+
+    # Distance to own class centroid
+    label_to_idx = {lbl.item(): i for i, lbl in enumerate(unique_labels)}
+    sample_centroid_idx = torch.tensor(
+        [label_to_idx[lbl.item()] for lbl in labels], device=device
+    )
+    own_centroid_dist = torch.norm(embeddings - centroids[sample_centroid_idx], dim=1)
+
+    # k-NN purity
+    _, knn_indices = dists.topk(k + 1, dim=1, largest=False)
+    knn_indices = knn_indices[:, 1:]  # Exclude self
+    knn_labels = labels[knn_indices]
+    knn_purity = (knn_labels == labels.unsqueeze(1)).float().mean(dim=1)
+
+    # Margin to nearest wrong-class sample
+    margin = torch.full((n_samples,), float("inf"), device=device)
+    for i in range(n_samples):
+        wrong_class_mask = labels != labels[i]
+        if wrong_class_mask.any():
+            min_wrong_dist = dists[i, wrong_class_mask].min()
+            margin[i] = min_wrong_dist
+
+    margin = torch.where(margin == float("inf"), torch.zeros_like(margin), margin)
+
+    # Normalize each component to [0, 1]
+    if own_centroid_dist.max() > 0:
+        centroid_score = 1.0 - (own_centroid_dist / own_centroid_dist.max())
+    else:
+        centroid_score = torch.ones_like(own_centroid_dist)
+
+    purity_score = knn_purity
+
+    if margin.max() > 0:
+        margin_score = margin / margin.max()
+    else:
+        margin_score = torch.ones_like(margin)
+
+    # Combined Q-Score
+    qscores = 0.3 * centroid_score + 0.4 * purity_score + 0.3 * margin_score
+
+    return QScoreResult(
+        mean_qscore=qscores.mean().item(),
+        std_qscore=qscores.std().item(),
+        min_qscore=qscores.min().item(),
+        max_qscore=qscores.max().item(),
+        per_sample_scores=qscores,
+    )
+
+
+def compute_layer_importance(
+    layer_outputs: list,
+    final_output: torch.Tensor,
+) -> torch.Tensor:
+    """
+    Compute layer importance based on contribution to final output.
+
+    Args:
+        layer_outputs: List of (B, N, D) tensors, one per layer
+        final_output: (B, N, D) final layer output
+
+    Returns:
+        (num_layers,) tensor of importance scores
+    """
+    if not layer_outputs:
+        return torch.tensor([])
+
+    device = final_output.device
+    num_layers = len(layer_outputs)
+
+    importance = torch.zeros(num_layers, device=device)
+
+    for i, layer_out in enumerate(layer_outputs):
+        layer_rep = layer_out.mean(dim=1)  # (B, D)
+        final_rep = final_output.mean(dim=1)  # (B, D)
+
+        layer_norm = F.normalize(layer_rep, dim=1)
+        final_norm = F.normalize(final_rep, dim=1)
+        sim = (layer_norm * final_norm).sum(dim=1).mean()
+
+        importance[i] = sim.item()
+
+    if importance.sum() > 0:
+        importance = importance / importance.sum()
+
+    return importance
+
+
+def compute_depth_utilization(layer_activations: list) -> float:
+    """
+    Compute depth utilization score.
+
+    Measures whether all layers are being utilized.
+
+    Returns:
+        Depth utilization score (0-1), where 1 = all layers contribute equally
+    """
+    if len(layer_activations) < 2:
+        return 1.0
+
+    import numpy as np
+
+    changes = []
+    for i in range(1, len(layer_activations)):
+        prev = layer_activations[i - 1].flatten()
+        curr = layer_activations[i].flatten()
+
+        change = (curr - prev).norm() / (prev.norm() + 1e-10)
+        changes.append(change.item())
+
+    changes = np.array(changes)
+
+    if changes.std() < 1e-10:
+        return 1.0
+
+    cv = changes.std() / (changes.mean() + 1e-10)
+    utilization = 1.0 / (1.0 + cv)
+
+    return float(utilization)
+
+
+def compute_rope_position_correlation(
+    attention_maps: list,
+    patch_grid_size: int,
+) -> float:
+    """
+    Compute how much attention correlates with spatial position (RoPE effect).
+
+    Args:
+        attention_maps: List of attention tensors per layer, each (B, H, N, N)
+        patch_grid_size: Size of patch grid (e.g., 14 for 14x14 patches)
+
+    Returns:
+        Position correlation score (higher = more position-aware)
+    """
+    if not attention_maps:
+        return 0.0
+
+    device = attention_maps[0].device
+    n_patches = patch_grid_size * patch_grid_size
+
+    # Create spatial distance matrix
+    positions = (
+        torch.stack(
+            torch.meshgrid(
+                torch.arange(patch_grid_size, device=device),
+                torch.arange(patch_grid_size, device=device),
+                indexing="ij",
+            ),
+            dim=-1,
+        )
+        .float()
+        .reshape(-1, 2)
+    )
+
+    spatial_dist = torch.cdist(positions, positions)
+    spatial_dist = spatial_dist / spatial_dist.max()
+
+    correlations = []
+
+    for layer_attn in attention_maps:
+        avg_attn = layer_attn.mean(dim=(0, 1))
+
+        # Handle CLS token
+        if avg_attn.shape[0] == n_patches + 1:
+            patch_attn = avg_attn[1:, 1:]
+        else:
+            patch_attn = avg_attn[:n_patches, :n_patches]
+
+        if patch_attn.shape[0] != n_patches:
+            continue
+
+        inv_dist = 1.0 - spatial_dist
+
+        attn_flat = patch_attn.flatten()
+        dist_flat = inv_dist.flatten()
+
+        # Pearson correlation
+        x = attn_flat - attn_flat.mean()
+        y = dist_flat - dist_flat.mean()
+
+        num = (x * y).sum()
+        denom = (x.pow(2).sum() * y.pow(2).sum()).sqrt()
+
+        if denom > 1e-10:
+            correlations.append((num / denom).item())
+
+    if not correlations:
+        return 0.0
+
+    import numpy as np
+
+    return float(np.mean(correlations))
+
+
+def compute_swiglu_sparsity(mlp_activations: list) -> dict:
+    """
+    Compute SwiGLU activation sparsity for JiT models.
+
+    Args:
+        mlp_activations: List of MLP output tensors per layer, each (B, N, D)
+
+    Returns:
+        Dict with sparsity metrics per layer and overall
+    """
+    if not mlp_activations:
+        return {"overall_sparsity": 0.0}
+
+    import numpy as np
+
+    sparsity_per_layer = []
+
+    for acts in mlp_activations:
+        threshold = 0.01 * acts.abs().max()
+        sparse_count = (acts.abs() < threshold).float().mean().item()
+        sparsity_per_layer.append(sparse_count)
+
+    return {
+        "overall_sparsity": float(np.mean(sparsity_per_layer)),
+        "sparsity_per_layer": sparsity_per_layer,
+        "max_sparsity": float(np.max(sparsity_per_layer)),
+        "min_sparsity": float(np.min(sparsity_per_layer)),
     }

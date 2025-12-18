@@ -56,6 +56,26 @@ from utils.metrics import (
     compute_attention_distance_metrics,
     compute_encoder_block_opt_stats,
     estimate_intrinsic_dim_twonn,
+    # New research-backed metrics
+    compute_head_specialization,
+    classify_attention_patterns,
+    compute_representation_qscore,
+    compute_rope_position_correlation,
+)
+from utils.health_checks import (
+    check_representation_health,
+    check_attention_health,
+    check_gradient_health,
+    check_training_health,
+    generate_health_summary_html,
+    compute_overall_health_score,
+)
+from utils.dashboards import (
+    generate_epoch_summary_dashboard,
+    generate_epoch_delta_dashboard,
+    generate_training_radar,
+    generate_pattern_distribution_chart,
+    generate_layer_importance_curve,
 )
 
 # Attention Analysis Module
@@ -1196,6 +1216,19 @@ def main():
     parser.add_argument("--landscape2d_interval", type=int, default=None)
     parser.add_argument("--landscape2d_radius", type=float, default=None)
     parser.add_argument("--landscape2d_points", type=int, default=None)
+    # Quick verification / testing
+    parser.add_argument(
+        "--max_train_samples",
+        type=int,
+        default=None,
+        help="Limit training samples (for quick verification)",
+    )
+    parser.add_argument(
+        "--max_val_samples",
+        type=int,
+        default=None,
+        help="Limit validation samples (for quick verification)",
+    )
     args = parser.parse_args()
 
     # Create config with overrides
@@ -1300,6 +1333,10 @@ def main():
                 wandb.define_metric("attribution/*", step_metric="epoch")
                 wandb.define_metric("faithfulness/*", step_metric="epoch")
                 wandb.define_metric("entropy/*", step_metric="step")
+                # Production Dashboard metrics
+                wandb.define_metric("summary/*", step_metric="epoch")
+                wandb.define_metric("health/*", step_metric="epoch")
+                wandb.define_metric("arch/*", step_metric="epoch")
         except ImportError:
             print("wandb not installed, skipping logging")
             config.use_wandb = False
@@ -1314,6 +1351,8 @@ def main():
         local_crops_size=config.local_crops_size,
         local_crops_scale=config.local_crops_scale,
         global_crops_scale=config.global_crops_scale,
+        max_train_samples=getattr(config, "max_train_samples", None),
+        max_val_samples=getattr(config, "max_val_samples", None),
     )
     print(f"Train samples: {len(train_loader.dataset)}")
     print(f"Val samples (ImageNette): {len(val_loader_nette.dataset)}")
@@ -1550,6 +1589,21 @@ def main():
     prev_rep_woof = None
     prev_block_reps_nette = None
     prev_block_reps_woof = None
+
+    # Initialize metric history for dashboard generation
+    metric_history: dict[str, list[float]] = {
+        "val_accuracy_nette": [],
+        "val_accuracy_woof": [],
+        "knn/nette_top1": [],
+        "knn/woof_top1": [],
+        "train/loss": [],
+        "train/sigreg": [],
+        "train/prediction": [],
+        "epoch_attn/entropy": [],
+        "rep/effective_dim": [],
+        "rep/isotropy": [],
+    }
+    prev_epoch_metrics: dict[str, float] = {}
 
     def _every(ep: int, interval: int) -> bool:
         """Return True if a diagnostic should run this epoch (interval<=0 disables)."""
@@ -3178,6 +3232,7 @@ def main():
                 if (
                     config.attention_analysis_enabled
                     and attribution_probe_images is not None
+                    and config.use_wandb
                 ):
                     try:
                         # Attribution visualization
@@ -3325,6 +3380,501 @@ def main():
 
                     except Exception as e:
                         print(f"Attention analysis failed: {e}")
+
+                # ==============================================================
+                # Production Dashboard - Health Checks & Summary Dashboards
+                # ==============================================================
+                if (
+                    getattr(config, "production_dashboard_enabled", True)
+                    and config.use_wandb
+                ):
+                    try:
+                        # Fetch diagnostic batch for dashboard visualizations
+                        diag_crops_dash, _ = next(iter(train_loader))
+                        b_dash = min(
+                            config.diagnostic_batch_size, len(diag_crops_dash[0])
+                        )
+                        diag_images = diag_crops_dash[0][:b_dash].to(device)
+
+                        # Get attention maps if available
+                        diag_attn_maps = None
+                        for blk in model.encoder.blocks:
+                            attn = getattr(blk, "attn", None)
+                            if attn is not None and hasattr(attn, "output_attention"):
+                                attn.output_attention = True
+
+                        with torch.no_grad():
+                            encoder_out = model.encoder(diag_images)
+                            if isinstance(encoder_out, tuple):
+                                encoder_out = encoder_out[0]
+                            # Collect attention maps
+                            attn_list = []
+                            for blk in model.encoder.blocks:
+                                attn = getattr(blk, "attn", None)
+                                if (
+                                    attn is not None
+                                    and hasattr(attn, "attn_map")
+                                    and attn.attn_map is not None
+                                ):
+                                    attn_list.append(attn.attn_map.detach())
+                            if attn_list:
+                                diag_attn_maps = torch.stack(
+                                    attn_list, dim=1
+                                )  # (B, L, H, N, N)
+
+                        # Disable attention output after collecting
+                        for blk in model.encoder.blocks:
+                            attn = getattr(blk, "attn", None)
+                            if attn is not None and hasattr(attn, "output_attention"):
+                                attn.output_attention = False
+
+                        # Collect current epoch metrics
+                        current_epoch_metrics = {
+                            "val_accuracy_nette": val_metrics_nette.get(
+                                "val_accuracy", 0
+                            )
+                            / 100
+                            if val_metrics_nette
+                            else 0,
+                            "val_accuracy_woof": val_metrics_woof.get("val_accuracy", 0)
+                            / 100
+                            if val_metrics_woof
+                            else 0,
+                            "knn/nette_top1": knn_metrics_nette.get("knn_top1", 0),
+                            "knn/woof_top1": knn_metrics_woof.get("knn_top1", 0),
+                            "train/loss": train_metrics.get("loss", 0),
+                            "train/sigreg": train_metrics.get("sigreg_loss", 0),
+                            "train/prediction": train_metrics.get("prediction_loss", 0),
+                            "epoch_attn/entropy": 0,  # Will be filled if available
+                            "rep/effective_dim": 0,
+                            "rep/isotropy": 0,
+                        }
+
+                        # Update metric history
+                        for key in metric_history:
+                            if key in current_epoch_metrics:
+                                metric_history[key].append(current_epoch_metrics[key])
+
+                        # Health checks
+                        if getattr(
+                            config, "health_check_enabled", True
+                        ) and _every_or_first(
+                            epoch, getattr(config, "health_check_interval", 1)
+                        ):
+                            # Get representation stats from a small batch
+                            with torch.no_grad():
+                                if diag_images is not None:
+                                    rep_out = model.encoder(diag_images.to(device))
+                                    if isinstance(rep_out, tuple):
+                                        rep_out = rep_out[0]
+                                    pooled = rep_out.mean(dim=1)
+                                    rep_stats = compute_representation_stats(pooled)
+                                    current_epoch_metrics["rep/effective_dim"] = (
+                                        rep_stats.get("effective_dim", 0)
+                                    )
+                                    current_epoch_metrics["rep/isotropy"] = (
+                                        rep_stats.get("isotropy", 0)
+                                    )
+
+                                    # Check representation health
+                                    rep_health = check_representation_health(
+                                        effective_dim=rep_stats.get("effective_dim"),
+                                        isotropy=rep_stats.get("isotropy"),
+                                        norm_mean=rep_stats.get("norm_mean"),
+                                        norm_std=rep_stats.get("norm_std"),
+                                        variance=rep_stats.get("variance"),
+                                    )
+
+                                    # Check gradient health
+                                    grad_norms = compute_global_norms(model)
+                                    grad_health = check_gradient_health(
+                                        grad_norm=grad_norms.get("grad_norm"),
+                                        param_norm=grad_norms.get("param_norm"),
+                                    )
+
+                                    # Check attention health (simplified)
+                                    attn_health = check_attention_health(
+                                        entropy_mean=current_epoch_metrics.get(
+                                            "epoch_attn/entropy", 2.0
+                                        ),
+                                    )
+
+                                    # Check training health
+                                    training_health = check_training_health(
+                                        loss=train_metrics.get("loss"),
+                                        accuracy=val_metrics_nette.get(
+                                            "val_accuracy", 0
+                                        )
+                                        / 100
+                                        if val_metrics_nette
+                                        else 0,
+                                        epoch=epoch,
+                                    )
+
+                                    # Generate health summary HTML
+                                    health_html = generate_health_summary_html(
+                                        rep_health,
+                                        attn_health,
+                                        grad_health,
+                                        training_health,
+                                        epoch=epoch,
+                                        metrics=current_epoch_metrics,
+                                    )
+
+                                    # Compute overall health score
+                                    overall_score = compute_overall_health_score(
+                                        rep_health, attn_health, grad_health
+                                    )
+
+                                    # Log health metrics
+                                    wandb.log(
+                                        {
+                                            "health/rep_status": rep_health.status.value,
+                                            "health/attn_status": attn_health.status.value,
+                                            "health/grad_status": grad_health.status.value,
+                                            "health/training_status": training_health.status.value,
+                                            "health/overall_score": overall_score,
+                                            "health/rep_score": rep_health.score,
+                                            "health/attn_score": attn_health.score,
+                                            "health/grad_score": grad_health.score,
+                                            "health/recommendation": wandb.Html(
+                                                health_html
+                                            ),
+                                        },
+                                        commit=False,
+                                    )
+
+                        # Summary dashboard
+                        if _every_or_first(
+                            epoch, getattr(config, "summary_dashboard_interval", 1)
+                        ):
+                            try:
+                                dashboard = generate_epoch_summary_dashboard(
+                                    epoch=epoch,
+                                    metrics=current_epoch_metrics,
+                                    history=metric_history,
+                                )
+                                wandb.log(
+                                    {
+                                        "summary/dashboard": wandb.Image(
+                                            dashboard, caption=f"Epoch {epoch}"
+                                        )
+                                    },
+                                    commit=False,
+                                )
+                            except Exception as e:
+                                print(f"  Dashboard generation failed: {e}")
+
+                        # Epoch delta dashboard
+                        if epoch > 1 and _every_or_first(
+                            epoch, getattr(config, "epoch_delta_interval", 1)
+                        ):
+                            try:
+                                delta_dashboard = generate_epoch_delta_dashboard(
+                                    current_epoch=epoch,
+                                    current_metrics=current_epoch_metrics,
+                                    previous_metrics=prev_epoch_metrics,
+                                )
+                                wandb.log(
+                                    {
+                                        "summary/epoch_delta": wandb.Image(
+                                            delta_dashboard, caption=f"Epoch {epoch}"
+                                        )
+                                    },
+                                    commit=False,
+                                )
+                            except Exception as e:
+                                print(f"  Delta dashboard failed: {e}")
+
+                        # Training radar chart
+                        if _every_or_first(
+                            epoch, getattr(config, "training_radar_interval", 5)
+                        ):
+                            try:
+                                radar = generate_training_radar(
+                                    current_metrics=current_epoch_metrics,
+                                    target_metrics={
+                                        "val_accuracy": 0.90,
+                                        "knn_accuracy": 0.85,
+                                        "eff_dimension": 0.80,
+                                        "attn_diversity": 0.70,
+                                        "grad_health": 0.80,
+                                        "head_specialization": 0.70,
+                                    },
+                                )
+                                wandb.log(
+                                    {
+                                        "summary/progress_radar": wandb.Image(
+                                            radar, caption=f"Epoch {epoch}"
+                                        )
+                                    },
+                                    commit=False,
+                                )
+                            except Exception as e:
+                                print(f"  Radar chart failed: {e}")
+
+                        # Pattern classification
+                        if diag_attn_maps is not None and _every_or_first(
+                            epoch, getattr(config, "pattern_classification_interval", 5)
+                        ):
+                            try:
+                                pattern_result = classify_attention_patterns(
+                                    diag_attn_maps
+                                )
+                                wandb.log(
+                                    {
+                                        "attn/pattern_parallel": pattern_result.pattern_distribution.get(
+                                            "parallel", 0
+                                        ),
+                                        "attn/pattern_radioactive": pattern_result.pattern_distribution.get(
+                                            "radioactive", 0
+                                        ),
+                                        "attn/pattern_homogeneous": pattern_result.pattern_distribution.get(
+                                            "homogeneous", 0
+                                        ),
+                                        "attn/pattern_xtype": pattern_result.pattern_distribution.get(
+                                            "xtype", 0
+                                        ),
+                                        "attn/pattern_compound": pattern_result.pattern_distribution.get(
+                                            "compound", 0
+                                        ),
+                                        "attn/pattern_dominant": pattern_result.dominant_pattern,
+                                    },
+                                    commit=False,
+                                )
+
+                                # Pattern distribution chart
+                                pattern_chart = generate_pattern_distribution_chart(
+                                    pattern_result.pattern_counts
+                                )
+                                wandb.log(
+                                    {
+                                        "attn/pattern_distribution": wandb.Image(
+                                            pattern_chart
+                                        )
+                                    },
+                                    commit=False,
+                                )
+                            except Exception as e:
+                                print(f"  Pattern classification failed: {e}")
+
+                        # Head specialization analysis
+                        if diag_attn_maps is not None and _every_or_first(
+                            epoch,
+                            getattr(config, "head_specialization_analysis_interval", 5),
+                        ):
+                            try:
+                                spec_result = compute_head_specialization(
+                                    diag_attn_maps
+                                )
+                                wandb.log(
+                                    {
+                                        "arch/head_redundancy": spec_result.redundancy_score,
+                                        "arch/diversity_score": spec_result.diversity_score,
+                                    },
+                                    commit=False,
+                                )
+                            except Exception as e:
+                                print(f"  Head specialization analysis failed: {e}")
+
+                        # Q-Score computation
+                        if _every_or_first(
+                            epoch, getattr(config, "qscore_interval", 10)
+                        ):
+                            try:
+                                # Fetch a batch with labels for Q-Score
+                                qscore_crops, qscore_labels = next(iter(train_loader))
+                                qscore_max = getattr(config, "qscore_max_samples", 1024)
+                                qscore_crops = [c[:qscore_max] for c in qscore_crops]
+                                qscore_labels = qscore_labels[:qscore_max]
+                                qscore_images = qscore_crops[0].to(device)
+
+                                with torch.no_grad():
+                                    qscore_out = model.encoder(qscore_images)
+                                    if isinstance(qscore_out, tuple):
+                                        qscore_out = qscore_out[0]
+                                    qscore_embeddings = qscore_out.mean(dim=1)
+
+                                qscore_result = compute_representation_qscore(
+                                    qscore_embeddings, qscore_labels.to(device)
+                                )
+                                wandb.log(
+                                    {
+                                        "rep/qscore_mean": qscore_result.mean_qscore,
+                                        "rep/qscore_std": qscore_result.std_qscore,
+                                        "rep/qscore_min": qscore_result.min_qscore,
+                                        "rep/qscore_max": qscore_result.max_qscore,
+                                    },
+                                    commit=False,
+                                )
+                                del (
+                                    qscore_crops,
+                                    qscore_labels,
+                                    qscore_images,
+                                    qscore_out,
+                                    qscore_embeddings,
+                                )
+                            except Exception as e:
+                                print(f"  Q-Score computation failed: {e}")
+
+                        # JiT-specific metrics
+                        if config.encoder == "jit":
+                            # RoPE position correlation
+                            if diag_attn_maps is not None and _every_or_first(
+                                epoch, getattr(config, "rope_correlation_interval", 10)
+                            ):
+                                try:
+                                    num_patches = config.img_size // config.patch_size
+                                    rope_corr = compute_rope_position_correlation(
+                                        diag_attn_maps, (num_patches, num_patches)
+                                    )
+                                    wandb.log(
+                                        {"arch/rope_position_corr": rope_corr},
+                                        commit=False,
+                                    )
+                                except Exception as e:
+                                    print(f"  RoPE correlation failed: {e}")
+
+                            # SwiGLU sparsity (requires MLP activations - use proxy from grad stats)
+                            if _every_or_first(
+                                epoch, getattr(config, "swiglu_sparsity_interval", 10)
+                            ):
+                                try:
+                                    # Estimate sparsity from MLP weight statistics as proxy
+                                    swiglu_stats = {
+                                        "mean_sparsity": 0.0,
+                                        "per_layer_sparsity": [],
+                                    }
+                                    for i, blk in enumerate(model.encoder.blocks):
+                                        if hasattr(blk, "mlp"):
+                                            mlp = blk.mlp
+                                            if hasattr(mlp, "w1") and hasattr(
+                                                mlp, "w2"
+                                            ):
+                                                # SwiGLU: approximate activation sparsity
+                                                with torch.no_grad():
+                                                    w1_abs = (
+                                                        mlp.w1.weight.abs()
+                                                        .mean()
+                                                        .item()
+                                                    )
+                                                    w2_abs = (
+                                                        mlp.w2.weight.abs()
+                                                        .mean()
+                                                        .item()
+                                                    )
+                                                    # Gate ratio as sparsity proxy
+                                                    sparsity = w2_abs / (w1_abs + 1e-8)
+                                                    sparsity = min(1.0, sparsity)
+                                                swiglu_stats[
+                                                    "per_layer_sparsity"
+                                                ].append(sparsity)
+                                    if swiglu_stats["per_layer_sparsity"]:
+                                        swiglu_stats["mean_sparsity"] = sum(
+                                            swiglu_stats["per_layer_sparsity"]
+                                        ) / len(swiglu_stats["per_layer_sparsity"])
+                                    wandb.log(
+                                        {
+                                            "arch/swiglu_sparsity": swiglu_stats[
+                                                "mean_sparsity"
+                                            ]
+                                        },
+                                        commit=False,
+                                    )
+                                except Exception as e:
+                                    print(f"  SwiGLU sparsity failed: {e}")
+
+                        # Layer importance analysis
+                        if _every_or_first(
+                            epoch, getattr(config, "layer_importance_interval", 10)
+                        ):
+                            try:
+                                # Compute layer importance from block output norms
+                                layer_importance_scores = []
+                                with torch.no_grad():
+                                    if diag_images is not None:
+                                        x = diag_images.to(device)
+                                        # Forward through patch embed
+                                        if hasattr(model.encoder, "patch_embed"):
+                                            x = model.encoder.patch_embed(x)
+                                        elif hasattr(
+                                            model.encoder, "bottleneck_patch_embed"
+                                        ):
+                                            x = model.encoder.bottleneck_patch_embed(x)
+
+                                        # Add pos embed if exists
+                                        if (
+                                            hasattr(model.encoder, "pos_embed")
+                                            and model.encoder.pos_embed is not None
+                                        ):
+                                            x = x + model.encoder.pos_embed
+
+                                        # Collect layer output norms
+                                        prev_norm = x.norm(dim=-1).mean().item()
+                                        for blk in model.encoder.blocks:
+                                            x = blk(x)
+                                            curr_norm = x.norm(dim=-1).mean().item()
+                                            # Importance = relative change in norm
+                                            importance = abs(curr_norm - prev_norm) / (
+                                                prev_norm + 1e-8
+                                            )
+                                            layer_importance_scores.append(importance)
+                                            prev_norm = curr_norm
+
+                                if layer_importance_scores:
+                                    # Normalize to sum to 1
+                                    total = sum(layer_importance_scores) + 1e-8
+                                    layer_importance_scores = [
+                                        s / total for s in layer_importance_scores
+                                    ]
+
+                                    # Depth utilization: how evenly distributed is importance
+                                    import numpy as np
+
+                                    scores_arr = np.array(layer_importance_scores)
+                                    uniform = np.ones_like(scores_arr) / len(scores_arr)
+                                    # KL divergence from uniform (lower = more uniform)
+                                    kl_div = np.sum(
+                                        scores_arr * np.log(scores_arr / uniform + 1e-8)
+                                    )
+                                    depth_util = 1.0 / (
+                                        1.0 + kl_div
+                                    )  # Transform to 0-1 scale
+
+                                    wandb.log(
+                                        {
+                                            "arch/depth_utilization": depth_util,
+                                            "arch/layer_importance_std": float(
+                                                np.std(scores_arr)
+                                            ),
+                                        },
+                                        commit=False,
+                                    )
+
+                                    # Generate layer importance curve
+                                    importance_tensor = torch.tensor(
+                                        layer_importance_scores
+                                    )
+                                    importance_curve = generate_layer_importance_curve(
+                                        importance_tensor
+                                    )
+                                    wandb.log(
+                                        {
+                                            "arch/layer_importance_curve": wandb.Image(
+                                                importance_curve,
+                                                caption=f"Epoch {epoch}",
+                                            )
+                                        },
+                                        commit=False,
+                                    )
+                            except Exception as e:
+                                print(f"  Layer importance analysis failed: {e}")
+
+                        # Store current metrics for next epoch delta
+                        prev_epoch_metrics = current_epoch_metrics.copy()
+
+                    except Exception as e:
+                        print(f"Production dashboard failed: {e}")
 
             except Exception as e:
                 print(f"Error generating visualization: {e}")
