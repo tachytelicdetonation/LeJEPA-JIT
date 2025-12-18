@@ -16,6 +16,17 @@ from PIL import Image
 import matplotlib.pyplot as plt
 
 
+def _fig_to_array(fig) -> np.ndarray:
+    """Convert matplotlib figure to numpy array (compatible with all versions)."""
+    fig.canvas.draw()
+    if hasattr(fig.canvas, "buffer_rgba"):
+        buf = np.asarray(fig.canvas.buffer_rgba())
+        return buf[..., :3]  # RGBA -> RGB
+    # Fallback for older matplotlib
+    img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    return img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+
+
 def compare_methods_visual(
     image: Image.Image | torch.Tensor,
     method_attributions: dict[str, torch.Tensor],
@@ -67,9 +78,7 @@ def compare_methods_visual(
     plt.tight_layout()
 
     # Convert to PIL
-    fig.canvas.draw()
-    img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    img_array = _fig_to_array(fig)
     plt.close(fig)
 
     return Image.fromarray(img_array)
@@ -148,9 +157,7 @@ def plot_faithfulness_curves(
     plt.tight_layout()
 
     # Convert to PIL
-    fig.canvas.draw()
-    img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    img_array = _fig_to_array(fig)
     plt.close(fig)
 
     return Image.fromarray(img_array)
@@ -219,9 +226,7 @@ def plot_faithfulness_comparison_bar(
 
     plt.tight_layout()
 
-    fig.canvas.draw()
-    img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    img_array = _fig_to_array(fig)
     plt.close(fig)
 
     return Image.fromarray(img_array)
@@ -265,9 +270,7 @@ def plot_entropy_evolution(
 
     plt.tight_layout()
 
-    fig.canvas.draw()
-    img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    img_array = _fig_to_array(fig)
     plt.close(fig)
 
     return Image.fromarray(img_array)
@@ -320,9 +323,7 @@ def plot_head_importance(
 
     plt.tight_layout()
 
-    fig.canvas.draw()
-    img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    img_array = _fig_to_array(fig)
     plt.close(fig)
 
     return Image.fromarray(img_array)
@@ -357,9 +358,7 @@ def plot_head_similarity(
     plt.colorbar(im, ax=ax, label="Cosine Similarity")
     plt.tight_layout()
 
-    fig.canvas.draw()
-    img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    img_array = _fig_to_array(fig)
     plt.close(fig)
 
     return Image.fromarray(img_array)

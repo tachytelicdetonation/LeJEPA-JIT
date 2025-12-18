@@ -11,6 +11,17 @@ from PIL import Image
 import matplotlib.pyplot as plt
 
 
+def _fig_to_array(fig) -> np.ndarray:
+    """Convert matplotlib figure to numpy array (compatible with all versions)."""
+    fig.canvas.draw()
+    if hasattr(fig.canvas, "buffer_rgba"):
+        buf = np.asarray(fig.canvas.buffer_rgba())
+        return buf[..., :3]  # RGBA -> RGB
+    # Fallback for older matplotlib
+    img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+    return img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+
+
 def attribution_to_heatmap(
     attribution: torch.Tensor | np.ndarray,
     cmap: str = "jet",
@@ -139,9 +150,7 @@ def create_side_by_side(
     plt.tight_layout()
 
     # Convert to PIL
-    fig.canvas.draw()
-    img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    img_array = _fig_to_array(fig)
     plt.close(fig)
 
     return Image.fromarray(img_array)
@@ -264,9 +273,7 @@ def generate_per_layer_heatmaps(
     plt.tight_layout()
 
     # Convert to PIL
-    fig.canvas.draw()
-    img_array = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
-    img_array = img_array.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+    img_array = _fig_to_array(fig)
     plt.close(fig)
 
     return Image.fromarray(img_array)

@@ -3050,8 +3050,8 @@ def main():
                             int(config.diagnostic_batch_size),
                             int(diag_labels.shape[0]),
                         )
-                        diag_crops = [c[:b] for c in diag_crops]
-                        diag_labels = diag_labels[:b]
+                        diag_crops = [c[:b].to(device) for c in diag_crops]
+                        diag_labels = diag_labels[:b].to(device)
                         # Use loss-landscapes library for 2D landscape
                         metric = LeJEPALossMetric(
                             probe,
@@ -3390,7 +3390,14 @@ def main():
                 ):
                     try:
                         # Fetch diagnostic batch for dashboard visualizations
-                        diag_crops_dash, _ = next(iter(train_loader))
+                        batch_data = next(iter(train_loader))
+                        if (
+                            isinstance(batch_data, (list, tuple))
+                            and len(batch_data) >= 2
+                        ):
+                            diag_crops_dash = batch_data[0]
+                        else:
+                            diag_crops_dash = batch_data
                         b_dash = min(
                             config.diagnostic_batch_size, len(diag_crops_dash[0])
                         )
