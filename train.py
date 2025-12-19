@@ -71,6 +71,7 @@ from utils.health_checks import (
     check_training_health,
     generate_health_summary_html,
     compute_overall_health_score,
+    HealthStatus,
 )
 from utils.dashboards import (
     generate_epoch_summary_dashboard,
@@ -124,6 +125,77 @@ def _cleanup_gpu_memory(device: torch.device) -> None:
     gc.collect()
     if device.type == "cuda":
         torch.cuda.empty_cache()
+
+
+def _build_visualization_guide() -> tuple[str, list[list[str]]]:
+    guide_rows = [
+        [
+            "vis/collapse_monitor",
+            "Embedding norms, pairwise cosine similarity, singular values.",
+            "High cosine ~1 and low effective rank => collapse risk.",
+            "Increase lambda_sigreg, reduce LR, verify augmentations.",
+        ],
+        [
+            "vis/token_similarity",
+            "Patch token cosine similarity matrix.",
+            "High off-diagonal similarity => redundant tokens.",
+            "Increase regularization, check data diversity.",
+        ],
+        [
+            "vis/rsm_layers",
+            "Representational similarity across samples per layer.",
+            "Uniform red maps => low diversity (collapse).",
+            "Increase data diversity or regularization.",
+        ],
+        [
+            "vis/layer_attention_evolution",
+            "Attention rollout across layers.",
+            "Early layers diffuse, later more focused.",
+            "If all layers look identical, check training signal.",
+        ],
+        [
+            "vis/per_head_attention",
+            "Per-head attention overlays on the same image.",
+            "Heads should specialize; identical maps are a red flag.",
+            "Tune LR/regularization, add dropout.",
+        ],
+        [
+            "vis/*_attn_rollout",
+            "Attention rollout overlay on image.",
+            "Hot regions should align with object of interest.",
+            "If focus is off-object, verify data/augmentations.",
+        ],
+        [
+            "vis/*_patch_pca",
+            "Patch PCA (RGB=PC1/PC2/PC3).",
+            "Similar colors imply similar patch features.",
+            "Noisy patterns may indicate unstable features.",
+        ],
+        [
+            "vis/embedding_pca_scatter_nette",
+            "2D PCA of pooled embeddings by class.",
+            "Separation suggests class-discriminative structure.",
+            "If all overlap, training signal may be weak.",
+        ],
+    ]
+
+    guide_html = """
+    <div style="font-family: -apple-system, BlinkMacSystemFont, monospace; padding: 12px;">
+      <h3>Visualization Guide</h3>
+      <p>Use this as a quick reference for how to interpret the core panels.</p>
+      <ul>
+        <li><b>Collapse Monitor:</b> High cosine similarity + low effective rank => collapse risk.</li>
+        <li><b>Token Similarity:</b> Red off-diagonals indicate redundant patch tokens.</li>
+        <li><b>RSM:</b> Uniform red implies low diversity across samples.</li>
+        <li><b>Layer Attention Evolution:</b> Expect early diffuse, later focused.</li>
+        <li><b>Per-Head Attention:</b> Heads should differ; identical heads are a warning.</li>
+        <li><b>Attention Rollout:</b> Focus should align with objects of interest.</li>
+        <li><b>Patch PCA:</b> Similar colors mean similar patch features.</li>
+        <li><b>Embedding PCA Scatter:</b> Separation indicates usable class structure.</li>
+      </ul>
+    </div>
+    """
+    return guide_html, guide_rows
 
 
 def _cosine_ema_coeff(
@@ -893,7 +965,7 @@ class LeJEPALossMetric(loss_landscapes.metrics.Metric):
         probe = self.probe.to(self.device)
         crops_dev = [c.to(self.device) for c in self.crops]
         labels_dev = self.labels.to(self.device)
-        
+
         with torch.no_grad():
             loss, _ = _compute_training_loss_from_crops(
                 model,
@@ -1381,6 +1453,28 @@ def main():
                 wandb.define_metric("summary/*", step_metric="epoch")
                 wandb.define_metric("health/*", step_metric="epoch")
                 wandb.define_metric("arch/*", step_metric="epoch")
+                try:
+                    guide_html, guide_rows = _build_visualization_guide()
+                    guide_table = wandb.Table(
+                        columns=[
+                            "visual_key",
+                            "what_it_shows",
+                            "how_to_read",
+                            "action_if_bad",
+                        ],
+                        data=guide_rows,
+                    )
+                    wandb.log(
+                        {
+                            "summary/visualization_guide": guide_table,
+                            "summary/visualization_guide_html": wandb.Html(
+                                guide_html, inject=True, data_is_not_path=True
+                            ),
+                        },
+                        commit=True,
+                    )
+                except Exception as e:
+                    print(f"Visualization guide logging failed: {e}")
         except ImportError:
             print("wandb not installed, skipping logging")
             config.use_wandb = False
@@ -1491,6 +1585,8 @@ def main():
         f"num_views={config.num_views}, lambda={config.lambda_sigreg}"
     )
     best_val_acc = 0
+    collapse_alerted = False
+    health_alerted = False
 
     # Fixed batch for visualization
     vis_images_nette = None
@@ -1859,7 +1955,11 @@ def main():
                         wandb.log(
                             {
                                 "vis/nette_patch_pca": wandb.Image(
-                                    vis_grid_nette, caption=f"Epoch {epoch}"
+                                    vis_grid_nette,
+                                    caption=(
+                                        f"Epoch {epoch} | Patch PCA (RGB=PC1/PC2/PC3). "
+                                        "Similar colors indicate similar features."
+                                    ),
                                 )
                             },
                             commit=False,
@@ -1886,7 +1986,11 @@ def main():
                         wandb.log(
                             {
                                 "vis/nette_attn_rollout": wandb.Image(
-                                    attn_grid_nette, caption=f"Epoch {epoch}"
+                                    attn_grid_nette,
+                                    caption=(
+                                        f"Epoch {epoch} | Attention rollout overlay. "
+                                        "Hot regions should align with the object."
+                                    ),
                                 )
                             },
                             commit=False,
@@ -1919,7 +2023,11 @@ def main():
                         wandb.log(
                             {
                                 "vis/woof_patch_pca": wandb.Image(
-                                    vis_grid_woof, caption=f"Epoch {epoch}"
+                                    vis_grid_woof,
+                                    caption=(
+                                        f"Epoch {epoch} | Patch PCA (RGB=PC1/PC2/PC3). "
+                                        "Similar colors indicate similar features."
+                                    ),
                                 )
                             },
                             commit=False,
@@ -1945,7 +2053,11 @@ def main():
                         wandb.log(
                             {
                                 "vis/woof_attn_rollout": wandb.Image(
-                                    attn_grid_woof, caption=f"Epoch {epoch}"
+                                    attn_grid_woof,
+                                    caption=(
+                                        f"Epoch {epoch} | Attention rollout overlay. "
+                                        "Hot regions should align with the object."
+                                    ),
                                 )
                             },
                             commit=False,
@@ -1978,7 +2090,11 @@ def main():
                         wandb.log(
                             {
                                 "vis/layer_attention_evolution": wandb.Image(
-                                    layer_attn_vis, caption=f"Epoch {epoch}"
+                                    layer_attn_vis,
+                                    caption=(
+                                        f"Epoch {epoch} | Per-layer attention rollout. "
+                                        "Early layers diffuse, later more focused."
+                                    ),
                                 )
                             },
                             commit=False,
@@ -1998,7 +2114,12 @@ def main():
                         wandb.log(
                             {
                                 "vis/per_head_attention": wandb.Image(
-                                    per_head_vis, caption=f"Epoch {epoch} Last Layer"
+                                    per_head_vis,
+                                    caption=(
+                                        f"Epoch {epoch} | Per-head attention overlays. "
+                                        "Heads should specialize; identical heads are a "
+                                        "warning sign."
+                                    ),
                                 )
                             },
                             commit=False,
@@ -2013,7 +2134,11 @@ def main():
                         wandb.log(
                             {
                                 "vis/token_similarity": wandb.Image(
-                                    token_sim_vis, caption=f"Epoch {epoch}"
+                                    token_sim_vis,
+                                    caption=(
+                                        f"Epoch {epoch} | Patch token cosine similarity. "
+                                        "High off-diagonal similarity suggests redundancy."
+                                    ),
                                 )
                             },
                             commit=False,
@@ -2026,7 +2151,11 @@ def main():
                         wandb.log(
                             {
                                 "vis/rsm_layers": wandb.Image(
-                                    rsm_vis, caption=f"Epoch {epoch}"
+                                    rsm_vis,
+                                    caption=(
+                                        f"Epoch {epoch} | RSM across layers. "
+                                        "Uniform red indicates low diversity."
+                                    ),
                                 )
                             },
                             commit=False,
@@ -2067,7 +2196,11 @@ def main():
                         wandb.log(
                             {
                                 "vis/embedding_pca_scatter_nette": wandb.Image(
-                                    pca_scatter, caption=f"Epoch {epoch}"
+                                    pca_scatter,
+                                    caption=(
+                                        f"Epoch {epoch} | 2D PCA of pooled embeddings. "
+                                        "Separation indicates class structure."
+                                    ),
                                 )
                             },
                             commit=False,
@@ -2133,7 +2266,11 @@ def main():
                         wandb.log(
                             {
                                 "vis/collapse_monitor": wandb.Image(
-                                    collapse_vis, caption=f"Epoch {epoch}"
+                                    collapse_vis,
+                                    caption=(
+                                        f"Epoch {epoch} | High cosine ~1 and low "
+                                        "effective rank indicate collapse risk."
+                                    ),
                                 )
                             },
                             commit=False,
@@ -2176,6 +2313,28 @@ def main():
                             },
                             commit=False,
                         )
+                        if not collapse_alerted:
+                            avg_sim = collapse_metrics.get("avg_similarity", 0.0)
+                            eff_rank = collapse_metrics.get("effective_rank", 0.0)
+                            if avg_sim > 0.99 or eff_rank < 10:
+                                try:
+                                    from wandb import AlertLevel
+
+                                    wandb.run.alert(
+                                        title="Potential representation collapse",
+                                        text=(
+                                            "Collapse metrics crossed a warning "
+                                            f"threshold (avg_similarity={avg_sim:.3f}, "
+                                            f"effective_rank={eff_rank:.1f}). "
+                                            "Consider increasing lambda_sigreg or "
+                                            "reducing LR."
+                                        ),
+                                        level=AlertLevel.WARN,
+                                        wait_duration=300,
+                                    )
+                                except Exception as e:
+                                    print(f"WandB alert failed: {e}")
+                                collapse_alerted = True
 
                         # SIGReg-aligned visualizations (every collapse_monitor_interval)
                         # 1. Isotropy evolution plot (only if we have enough data points)
@@ -2914,7 +3073,10 @@ def main():
                                     f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
                                 )
                         batch_data = next(iter(train_loader))
-                        if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
+                        if (
+                            isinstance(batch_data, (list, tuple))
+                            and len(batch_data) >= 2
+                        ):
                             diag_crops, diag_labels = batch_data[0], batch_data[1]
                         else:
                             diag_crops, diag_labels = batch_data, None
@@ -2967,7 +3129,10 @@ def main():
                                     f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
                                 )
                         batch_data = next(iter(train_loader))
-                        if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
+                        if (
+                            isinstance(batch_data, (list, tuple))
+                            and len(batch_data) >= 2
+                        ):
                             diag_crops, diag_labels = batch_data[0], batch_data[1]
                         else:
                             diag_crops, diag_labels = batch_data, None
@@ -3020,7 +3185,10 @@ def main():
                                     f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
                                 )
                         batch_data = next(iter(train_loader))
-                        if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
+                        if (
+                            isinstance(batch_data, (list, tuple))
+                            and len(batch_data) >= 2
+                        ):
                             diag_crops, diag_labels = batch_data[0], batch_data[1]
                         else:
                             diag_crops, diag_labels = batch_data, None
@@ -3095,7 +3263,10 @@ def main():
                                     f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
                                 )
                         batch_data = next(iter(train_loader))
-                        if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
+                        if (
+                            isinstance(batch_data, (list, tuple))
+                            and len(batch_data) >= 2
+                        ):
                             diag_crops, diag_labels = batch_data[0], batch_data[1]
                         else:
                             diag_crops, diag_labels = batch_data, None
@@ -3213,7 +3384,9 @@ def main():
                             wandb.log(
                                 {
                                     "epoch_opt/loss_landscape_interactive": wandb.Html(
-                                        html_str
+                                        html_str,
+                                        inject=True,
+                                        data_is_not_path=True,
                                     )
                                 },
                                 commit=False,
@@ -3246,7 +3419,10 @@ def main():
                                     f"Skipping heavy diagnostics: only {free_mb:.1f} MiB CUDA free"
                                 )
                         batch_data = next(iter(train_loader))
-                        if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
+                        if (
+                            isinstance(batch_data, (list, tuple))
+                            and len(batch_data) >= 2
+                        ):
                             diag_crops, diag_labels = batch_data[0], batch_data[1]
                         else:
                             diag_crops, diag_labels = batch_data, None
@@ -3512,11 +3688,11 @@ def main():
                                     and hasattr(attn, "attn_map")
                                     and attn.attn_map is not None
                                 ):
-                                    attn_list.append(attn.attn_map.detach())
+                                    # Move to CPU to avoid holding large GPU tensors.
+                                    attn_list.append(attn.attn_map.detach().cpu())
+                                    attn.attn_map = None
                             if attn_list:
-                                diag_attn_maps = torch.stack(
-                                    attn_list, dim=1
-                                )  # (B, L, H, N, N)
+                                diag_attn_maps = attn_list  # List[(B, H, N, N)]
 
                         # Disable attention output after collecting
                         for blk in model.encoder.blocks:
@@ -3616,6 +3792,12 @@ def main():
                                         epoch=epoch,
                                         metrics=current_epoch_metrics,
                                     )
+                                    health_dir = Path("health/recommendation")
+                                    health_dir.mkdir(parents=True, exist_ok=True)
+                                    health_path = health_dir / f"epoch_{epoch}.html"
+                                    health_path.write_text(
+                                        health_html, encoding="utf-8"
+                                    )
 
                                     # Compute overall health score
                                     overall_score = compute_overall_health_score(
@@ -3634,14 +3816,48 @@ def main():
                                             "health/attn_score": attn_health.score,
                                             "health/grad_score": grad_health.score,
                                             "health/recommendation": wandb.Html(
-                                                health_html
+                                                health_html,
+                                                inject=True,
+                                                data_is_not_path=True,
+                                            ),
+                                            "health/recommendation_path": str(
+                                                health_path
                                             ),
                                         },
                                         commit=False,
                                     )
+                                    if not health_alerted:
+                                        if any(
+                                            h.status == HealthStatus.CRITICAL
+                                            for h in (
+                                                rep_health,
+                                                attn_health,
+                                                grad_health,
+                                                training_health,
+                                            )
+                                            if h is not None
+                                        ):
+                                            try:
+                                                from wandb import AlertLevel
+
+                                                wandb.run.alert(
+                                                    title="Training health critical",
+                                                    text=(
+                                                        "One or more health checks are "
+                                                        "critical. Open the health report "
+                                                        "panel for recommendations."
+                                                    ),
+                                                    level=AlertLevel.ERROR,
+                                                    wait_duration=300,
+                                                )
+                                            except Exception as e:
+                                                print(f"WandB alert failed: {e}")
+                                            health_alerted = True
 
                                 try:
-                                    print("  Debug: Generating epoch summary dashboard...")
+                                    print(
+                                        "  Debug: Generating epoch summary dashboard..."
+                                    )
                                     dashboard = generate_epoch_summary_dashboard(
                                         epoch=epoch,
                                         metrics=current_epoch_metrics,
@@ -3663,16 +3879,21 @@ def main():
                                     epoch, getattr(config, "epoch_delta_interval", 1)
                                 ):
                                     try:
-                                        print("  Debug: Generating epoch delta dashboard...")
-                                        delta_dashboard = generate_epoch_delta_dashboard(
-                                            current_epoch=epoch,
-                                            current_metrics=current_epoch_metrics,
-                                            previous_metrics=prev_epoch_metrics,
+                                        print(
+                                            "  Debug: Generating epoch delta dashboard..."
+                                        )
+                                        delta_dashboard = (
+                                            generate_epoch_delta_dashboard(
+                                                current_epoch=epoch,
+                                                current_metrics=current_epoch_metrics,
+                                                previous_metrics=prev_epoch_metrics,
+                                            )
                                         )
                                         wandb.log(
                                             {
                                                 "summary/epoch_delta": wandb.Image(
-                                                    delta_dashboard, caption=f"Epoch {epoch}"
+                                                    delta_dashboard,
+                                                    caption=f"Epoch {epoch}",
                                                 )
                                             },
                                             commit=False,
@@ -3778,8 +3999,14 @@ def main():
                             try:
                                 # Fetch a batch with labels for Q-Score
                                 batch_data = next(iter(train_loader))
-                                if isinstance(batch_data, (list, tuple)) and len(batch_data) >= 2:
-                                    qscore_crops, qscore_labels = batch_data[0], batch_data[1]
+                                if (
+                                    isinstance(batch_data, (list, tuple))
+                                    and len(batch_data) >= 2
+                                ):
+                                    qscore_crops, qscore_labels = (
+                                        batch_data[0],
+                                        batch_data[1],
+                                    )
                                 else:
                                     qscore_crops, qscore_labels = batch_data, None
                                 qscore_max = getattr(config, "qscore_max_samples", 1024)
@@ -3972,11 +4199,26 @@ def main():
                         if "current_epoch_metrics" in locals():
                             prev_epoch_metrics = current_epoch_metrics.copy()
                         else:
-                            print("Warning: current_epoch_metrics not found, skipping history update.")
+                            print(
+                                "Warning: current_epoch_metrics not found, skipping history update."
+                            )
 
                     except Exception as e:
                         print(f"Production dashboard failed: {e}")
                     finally:
+                        # Drop references to large diagnostic tensors before cleanup.
+                        diag_attn_maps = None
+                        diag_images = None
+                        encoder_out = None
+                        attn_list = None
+                        diag_crops_dash = None
+                        first_crop = None
+                        batch_data = None
+                        rep_out = None
+                        pooled = None
+                        qscore_out = None
+                        qscore_embeddings = None
+                        qscore_images = None
                         _cleanup_gpu_memory(device)
 
             except Exception as e:

@@ -160,8 +160,8 @@ class VisionRotaryEmbedding(nn.Module):
         # Check if cached matches
         if self.cos_cached.shape[0] == seq_len:
             return (
-                self.cos_cached.to(x.dtype),
-                self.sin_cached.to(x.dtype),
+                self.cos_cached.to(device=x.device, dtype=x.dtype),
+                self.sin_cached.to(device=x.device, dtype=x.dtype),
             )
 
         # Determine if we can just slice (only if res matches max_res, unlikely for different scales)
